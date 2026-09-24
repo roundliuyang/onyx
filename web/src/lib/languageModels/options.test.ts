@@ -1,4 +1,9 @@
-import { buildLlmOptions, llmOptionKey } from "@/lib/languageModels/options";
+import {
+  buildLlmOptions,
+  filterModelConfigurations,
+  llmOptionKey,
+  type ModelOptionProvider,
+} from "@/lib/languageModels/options";
 import type {
   LLMProviderDescriptor,
   ModelConfiguration,
@@ -84,5 +89,72 @@ describe("buildLlmOptions", () => {
     expect(buildLlmOptions(providers, undefined, true)).toEqual([
       expect.objectContaining({ modelName: "hidden-model" }),
     ]);
+  });
+});
+
+describe("filterModelConfigurations", () => {
+  const providers: ModelOptionProvider[] = [
+    {
+      id: 1,
+      name: "OpenAI",
+      provider: "openai",
+      model_configurations: [
+        {
+          id: 11,
+          name: "gpt-4o",
+          is_visible: true,
+          max_input_tokens: null,
+          supports_image_input: true,
+          supports_reasoning: false,
+          effectiveDisplayName: "GPT-4o",
+        },
+        {
+          id: 12,
+          name: "o3-mini",
+          is_visible: false,
+          max_input_tokens: null,
+          supports_image_input: false,
+          supports_reasoning: true,
+          effectiveDisplayName: "o3-mini",
+        },
+      ],
+    },
+    {
+      id: 2,
+      name: null,
+      provider: "anthropic",
+      model_configurations: [
+        {
+          id: 21,
+          name: "claude-sonnet-4",
+          is_visible: true,
+          max_input_tokens: null,
+          supports_image_input: false,
+          supports_reasoning: false,
+          effectiveDisplayName: "Claude Sonnet 4",
+        },
+      ],
+    },
+  ];
+  const ids = (list: ModelOptionProvider[]) =>
+    list.flatMap((p) => p.model_configurations.map((mc) => mc.id));
+
+  test("drops hidden models by default and keeps them on request", () => {
+    expect(ids(filterModelConfigurations(providers))).toEqual([11, 21]);
+    expect(
+      ids(filterModelConfigurations(providers, { visibleOnly: false }))
+    ).toEqual([11, 12, 21]);
+  });
+
+  test("keeps only image-input models and drops providers left empty", () => {
+    const filtered = filterModelConfigurations(providers, { imageInput: true });
+    expect(filtered.map((p) => p.id)).toEqual([1]);
+    expect(ids(filtered)).toEqual([11]);
+  });
+
+  test("keeps the current value regardless of the other rules", () => {
+    expect(
+      ids(filterModelConfigurations(providers, { imageInput: true, keep: 12 }))
+    ).toEqual([11, 12]);
   });
 });

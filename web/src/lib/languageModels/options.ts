@@ -237,3 +237,59 @@ export function findModelConfigId(
   }
   return null;
 }
+
+// ---------------------------------------------------------------------------
+// findLlmOptionById
+// ---------------------------------------------------------------------------
+
+/** The option behind a `model_configuration_id`, hidden models included. */
+export function findLlmOptionById(
+  llmProviders: ModelOptionProvider[] | undefined,
+  modelConfigurationId: number | null
+): LLMOption | null {
+  if (modelConfigurationId === null) return null;
+  return (
+    buildLlmOptions(llmProviders, undefined, true).find(
+      (option) => option.modelConfigurationId === modelConfigurationId
+    ) ?? null
+  );
+}
+
+// ---------------------------------------------------------------------------
+// filterModelConfigurations
+// ---------------------------------------------------------------------------
+
+export interface FilterModelConfigurationsOptions {
+  /** Drop models an admin hid from users. Defaults to true. */
+  visibleOnly?: boolean;
+  /** Keep only models that accept image input. */
+  imageInput?: boolean;
+  /** A configuration id kept regardless: the current value stays listed. */
+  keep?: number | null;
+}
+
+/**
+ * Trims each provider's model list for a picker, dropping providers left
+ * empty. The pure counterpart of the chat picker's own filtering, for a
+ * dumb select that renders whatever it is given.
+ */
+export function filterModelConfigurations<T extends ModelOptionProvider>(
+  providers: T[],
+  {
+    visibleOnly = true,
+    imageInput = false,
+    keep = null,
+  }: FilterModelConfigurationsOptions = {}
+): T[] {
+  return providers
+    .map((provider) => ({
+      ...provider,
+      model_configurations: provider.model_configurations.filter(
+        (mc) =>
+          (keep !== null && mc.id === keep) ||
+          ((!visibleOnly || mc.is_visible) &&
+            (!imageInput || mc.supports_image_input))
+      ),
+    }))
+    .filter((provider) => provider.model_configurations.length > 0);
+}
