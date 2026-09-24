@@ -30,8 +30,8 @@ import {
 import { credentialTemplates } from "@/lib/connectors/credentials";
 import type { Credential } from "@/lib/connectors/types";
 import {
-  connectorConfigs,
   defaultRefreshFreqMinutes,
+  useConnectorConfiguration,
 } from "@/lib/connectors/connectors";
 import {
   createConnectorInitialValues,
@@ -140,6 +140,7 @@ export default function AddConnector({
   connector: ConfigurableSources;
 }) {
   const t = useTranslations("admin.connectorsList");
+  const oneDriveT = useTranslations("admin.connectorsList.oneDrive");
   const [currentPageUrl, setCurrentPageUrl] = useState<string | null>(null);
   const [oauthUrl, setOauthUrl] = useState<string | null>(null);
   const [isAuthorizing, setIsAuthorizing] = useState(false);
@@ -191,7 +192,13 @@ export default function AddConnector({
 
   // Get credential template and configuration
   const credentialTemplate = credentialTemplates[connector];
-  const configuration: ConnectionConfiguration = connectorConfigs[connector];
+  const configuration: ConnectionConfiguration =
+    useConnectorConfiguration(connector);
+  const formControlFieldNames = new Set(
+    [...configuration.values, ...configuration.advanced_values]
+      .filter((field) => field.type === "tab")
+      .map((field) => field.name)
+  );
 
   const [uploading, setUploading] = useState(false);
   const [creatingConnector, setCreatingConnector] = useState(false);
@@ -328,7 +335,12 @@ export default function AddConnector({
       initialValues={createConnectorInitialValues(connector)}
       validationSchema={createConnectorValidationSchema(
         connector,
-        isScopedManager
+        isScopedManager,
+        {
+          oneDriveUsersRequired: oneDriveT(
+            "indexingScope.specific.users.required"
+          ),
+        }
       )}
       onSubmit={async (values) => {
         const {
@@ -347,6 +359,9 @@ export default function AddConnector({
           connector_specific_config
         ).reduce(
           (acc, [key, value]) => {
+            if (formControlFieldNames.has(key)) {
+              return acc;
+            }
             // Filter out empty strings from arrays
             if (Array.isArray(value)) {
               value = (value as any[]).filter(
