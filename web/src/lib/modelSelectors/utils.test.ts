@@ -1,9 +1,9 @@
-import type { ModelOptionProvider } from "@/lib/languageModels/options";
 import {
   buildModelSelectOptions,
   fromSelectValue,
   toSelectValue,
 } from "./utils";
+import type { ModelOptionProvider } from "@/lib/languageModels/types";
 
 const providers: ModelOptionProvider[] = [
   {

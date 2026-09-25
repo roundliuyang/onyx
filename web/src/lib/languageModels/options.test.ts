@@ -2,12 +2,12 @@ import {
   buildLlmOptions,
   filterModelConfigurations,
   llmOptionKey,
-  type ModelOptionProvider,
 } from "@/lib/languageModels/options";
 import type {
   LLMProviderDescriptor,
   ModelConfiguration,
 } from "@/lib/languageModels/types";
+import type { ModelOptionProvider } from "@/lib/languageModels/types";
 
 function makeModelConfiguration(id: number, name: string): ModelConfiguration {
   return {

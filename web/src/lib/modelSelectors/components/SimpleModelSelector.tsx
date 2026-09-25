@@ -3,12 +3,12 @@
 import { useMemo } from "react";
 import { useTranslations } from "next-intl";
 import { InputSingleSelect } from "@opal/components";
-import type { ModelOptionProvider } from "@/lib/languageModels/options";
 import {
   buildModelSelectOptions,
   fromSelectValue,
   toSelectValue,
 } from "@/lib/modelSelectors/utils";
+import type { ModelOptionProvider } from "@/lib/languageModels/types";
 
 /** What `onChange` emits: only a nullable selector can emit null. */
 type EmittedModelConfigurationId<Nullable extends boolean> =

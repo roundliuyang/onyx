@@ -1,10 +1,7 @@
 import type { SelectDivider, SelectOption } from "@opal/components";
 import { getModelIcon } from "@/lib/languageModels";
-import {
-  buildLlmOptions,
-  groupLlmOptions,
-  type ModelOptionProvider,
-} from "@/lib/languageModels/options";
+import { buildLlmOptions, groupLlmOptions } from "@/lib/languageModels/options";
+import type { ModelOptionProvider } from "@/lib/languageModels/types";
 
 /** A model configuration id as an `InputSingleSelect` value; null is empty. */
 export function toSelectValue(modelConfigurationId: number | null): string {

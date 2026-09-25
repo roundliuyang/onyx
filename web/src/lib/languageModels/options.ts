@@ -6,44 +6,16 @@ import {
 } from "@/lib/languageModels/types";
 import { getModelIcon, getProvider } from "@/lib/languageModels";
 import { AGGREGATOR_PROVIDERS } from "@/lib/languageModels/svc";
-
-export type ModelOptionProvider = Pick<
-  LLMProviderDescriptor,
-  "id" | "name" | "provider" | "model_configurations"
->;
+import type {
+  FilterModelConfigurationsOptions,
+  LLMOption,
+  LLMOptionGroup,
+  ModelOptionProvider,
+} from "@/lib/languageModels/types";
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
-
-export interface LLMOption {
-  name: string;
-  provider: string;
-  providerDisplayName: string;
-  modelName: string;
-  modelConfigurationId?: number | null;
-  displayName: string;
-  description?: string;
-  vendor: string | null;
-  maxInputTokens?: number | null;
-  region?: string | null;
-  version?: string | null;
-  supportsReasoning?: boolean;
-  /** See ModelConfiguration.supported_reasoning_efforts. */
-  supportedReasoningEfforts?: ReasoningEffortOverride[];
-  /** See ModelConfiguration.reasoning_effort_max. */
-  reasoningEffortMax?: ReasoningEffortOverride | null;
-  reasoningEffortDefault?: ReasoningEffortOverride | null;
-  temperatureDefault?: number | null;
-  supportsImageInput?: boolean;
-}
-
-export interface LLMOptionGroup {
-  key: string;
-  displayName: string;
-  options: LLMOption[];
-  Icon: FunctionComponent<IconProps>;
-}
 
 /**
  * Sentinel option representing "no explicit model — use the global default."
@@ -258,15 +230,6 @@ export function findLlmOptionById(
 // ---------------------------------------------------------------------------
 // filterModelConfigurations
 // ---------------------------------------------------------------------------
-
-export interface FilterModelConfigurationsOptions {
-  /** Drop models an admin hid from users. Defaults to true. */
-  visibleOnly?: boolean;
-  /** Keep only models that accept image input. */
-  imageInput?: boolean;
-  /** A configuration id kept regardless: the current value stays listed. */
-  keep?: number | null;
-}
 
 /**
  * Trims each provider's model list for a picker, dropping providers left
