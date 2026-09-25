@@ -29,7 +29,10 @@ import {
 import { deleteLlmProvider } from "@/lib/languageModels/svc";
 import { buildLlmOptions, groupLlmOptions } from "@/lib/languageModels/options";
 import { findProviderOwningModelConfig } from "@/lib/languageModels/utils";
-import { findLlmOptionById } from "@/lib/languageModels/options";
+import {
+  filterModelConfigurations,
+  findLlmOptionById,
+} from "@/lib/languageModels/options";
 import { useSettings } from "@/lib/settings/hooks";
 import { updateAdminSettings } from "@/lib/settings/svc";
 import { SWR_KEYS } from "@/lib/swr-keys";
@@ -479,7 +482,10 @@ export default function LanguageModelsPage() {
                 withLabel
               >
                 <SimpleModelSelector
-                  providers={existingLlmProviders ?? []}
+                  providers={filterModelConfigurations(
+                    existingLlmProviders ?? [],
+                    { keep: defaultModelConfigId }
+                  )}
                   value={defaultModelConfigId}
                   onChange={(modelConfigurationId) => {
                     const opt = findLlmOptionById(

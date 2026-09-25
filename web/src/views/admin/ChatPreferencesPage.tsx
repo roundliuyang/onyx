@@ -26,7 +26,10 @@ import {
   type SelectOption,
 } from "@opal/components";
 import { SimpleModelSelector } from "@/lib/languageModels/components";
-import { findLlmOptionById } from "@/lib/languageModels/options";
+import {
+  filterModelConfigurations,
+  findLlmOptionById,
+} from "@/lib/languageModels/options";
 import { useAdminLanguageModels } from "@/lib/languageModels/hooks";
 import { findProviderOwningModelConfig } from "@/lib/languageModels/utils";
 import {
@@ -1135,7 +1138,9 @@ export default function ChatPreferencesPage() {
                     </Button>
                   )}
                   <SimpleModelSelector
-                    providers={llmProviders ?? []}
+                    providers={filterModelConfigurations(llmProviders ?? [], {
+                      keep: chatNamingModelConfigId,
+                    })}
                     value={chatNamingModelConfigId}
                     onChange={(modelConfigurationId) => {
                       const opt = findLlmOptionById(

@@ -95,6 +95,7 @@ import { useCloudSubscription } from "@/hooks/useCloudSubscription";
 import { useSmoothStreaming } from "@/hooks/useSmoothStreaming";
 import { hasPermission } from "@/lib/permissions";
 import {
+  filterModelConfigurations,
   findLlmOptionById,
   findModelConfigId,
 } from "@/lib/languageModels/options";
@@ -1244,6 +1245,14 @@ function ChatPreferencesSettings() {
   );
 
   const settings = useSettings();
+  // The user's default as a configuration id; null means the global default.
+  const defaultModelConfigId = user?.preferences?.default_model
+    ? findModelConfigId(
+        llmManager.llmProviders,
+        llmManager.currentLlm.provider,
+        llmManager.currentLlm.modelName
+      )
+    : null;
   const userTemperatureDefault = user?.preferences.temperature_default ?? null;
   const userEffortDefault = user?.preferences.reasoning_effort_default ?? null;
   // 0 mirrors the backend GEN_AI_TEMPERATURE fallback an untouched chat
@@ -1338,16 +1347,11 @@ function ChatPreferencesSettings() {
             >
               <SimpleModelSelector
                 nullable
-                providers={llmManager.llmProviders ?? []}
-                value={
-                  user?.preferences?.default_model
-                    ? findModelConfigId(
-                        llmManager.llmProviders,
-                        llmManager.currentLlm.provider,
-                        llmManager.currentLlm.modelName
-                      )
-                    : null
-                }
+                providers={filterModelConfigurations(
+                  llmManager.llmProviders ?? [],
+                  { keep: defaultModelConfigId }
+                )}
+                value={defaultModelConfigId}
                 onChange={(modelConfigurationId) => {
                   const opt = findLlmOptionById(
                     llmManager.llmProviders,

@@ -31,6 +31,7 @@ import { Content, InputHorizontal, InputVertical } from "@opal/layouts";
 import { useFormikContext } from "formik";
 import { SimpleModelSelector } from "@/lib/languageModels/components";
 import { useLanguageModelsForAgent } from "@/lib/languageModels/hooks";
+import { filterModelConfigurations } from "@/lib/languageModels/options";
 import {
   MAX_CHARACTERS_STARTER_MESSAGE,
   MAX_CHARACTERS_AGENT_DESCRIPTION,
@@ -1655,7 +1656,15 @@ export default function AgentEditorPage({
                                 >
                                   <SimpleModelSelector
                                     nullable
-                                    providers={agentLlmProviders ?? []}
+                                    providers={filterModelConfigurations(
+                                      agentLlmProviders ?? [],
+                                      {
+                                        keep:
+                                          (values.default_model_configuration_id as
+                                            | number
+                                            | null) ?? null,
+                                      }
+                                    )}
                                     value={
                                       (values.default_model_configuration_id as
                                         | number

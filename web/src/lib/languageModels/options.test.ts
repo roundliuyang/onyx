@@ -218,7 +218,8 @@ describe("model select options", () => {
   describe("buildModelSelectOptions", () => {
     test("renders every model given, hidden ones included, under a divider per provider", () => {
       const dividers = buildModelSelectOptions(providers);
-      expect(dividers.map((d) => d.title)).toEqual(["Anthropic", "OpenAI"]);
+      // A nameless provider groups under its product name.
+      expect(dividers.map((d) => d.title)).toEqual(["Claude", "OpenAI"]);
       expect(dividers[1]?.options.map((o) => [o.value, o.title])).toEqual([
         ["11", "GPT-4o"],
         ["12", "o3-mini"],
