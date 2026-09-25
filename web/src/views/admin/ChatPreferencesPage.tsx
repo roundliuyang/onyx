@@ -27,7 +27,7 @@ import {
 } from "@opal/components";
 import { SimpleModelSelector } from "@/lib/modelSelectors/components";
 import { findLlmOptionById } from "@/lib/languageModels/options";
-import { useAdminLLMProviders } from "@/lib/languageModels/hooks";
+import { useAdminLanguageModels } from "@/lib/languageModels/hooks";
 import { findProviderOwningModelConfig } from "@/lib/languageModels/utils";
 import {
   SvgAddLines,
@@ -743,7 +743,7 @@ export default function ChatPreferencesPage() {
     llmProviders,
     defaultChatNaming,
     refetch: refetchLlmProviders,
-  } = useAdminLLMProviders();
+  } = useAdminLanguageModels();
 
   // Resolve defaultChatNaming (id + name based) to a model_configuration_id
   // for the select.

@@ -30,7 +30,7 @@ import InputDatePickerField from "@/refresh-components/form/InputDatePickerField
 import { Content, InputHorizontal, InputVertical } from "@opal/layouts";
 import { useFormikContext } from "formik";
 import { SimpleModelSelector } from "@/lib/modelSelectors/components";
-import { useLLMProviders } from "@/lib/languageModels/hooks";
+import { useLanguageModelsForAgent } from "@/lib/languageModels/hooks";
 import {
   MAX_CHARACTERS_STARTER_MESSAGE,
   MAX_CHARACTERS_AGENT_DESCRIPTION,
@@ -424,7 +424,7 @@ export default function AgentEditorPage({
   const { vectorDbEnabled, appName } = useSettings();
   const businessTier = useTierAtLeast(Tier.BUSINESS);
   // The providers this agent may use; a new agent gets the unscoped list.
-  const { llmProviders: agentLlmProviders } = useLLMProviders(
+  const { llmProviders: agentLlmProviders } = useLanguageModelsForAgent(
     existingAgent?.id
   );
 

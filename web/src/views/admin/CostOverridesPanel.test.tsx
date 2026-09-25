@@ -44,7 +44,7 @@ jest.mock("@/lib/languageModels/costOverrides", () => ({
 }));
 
 jest.mock("@/lib/languageModels/hooks", () => ({
-  useAdminLLMProviders: () => ({
+  useAdminLanguageModels: () => ({
     llmProviders: [
       {
         id: 2,
