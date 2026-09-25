@@ -7,7 +7,7 @@ import {
   buildModelSelectOptions,
   fromSelectValue,
   toSelectValue,
-} from "@/lib/modelSelectors/utils";
+} from "@/lib/languageModels/options";
 import type { ModelOptionProvider } from "@/lib/languageModels/types";
 
 /** What `onChange` emits: only a nullable selector can emit null. */

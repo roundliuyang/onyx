@@ -66,7 +66,7 @@ jest.mock("@/lib/languageModels/hooks", () => ({
   }),
 }));
 
-jest.mock("@/lib/modelSelectors/components", () => ({
+jest.mock("@/lib/languageModels/components", () => ({
   SimpleModelSelector: ({
     onChange,
   }: {

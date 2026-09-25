@@ -33,7 +33,7 @@ import { findLlmOptionById } from "@/lib/languageModels/options";
 import { useSettings } from "@/lib/settings/hooks";
 import { updateAdminSettings } from "@/lib/settings/svc";
 import { SWR_KEYS } from "@/lib/swr-keys";
-import { SimpleModelSelector } from "@/lib/modelSelectors/components";
+import { SimpleModelSelector } from "@/lib/languageModels/components";
 import { ConfirmationModalLayout } from "@opal/layouts";
 import { useCreateModal } from "@opal/components";
 import { LLMProviderName, LLMProviderView } from "@/lib/languageModels/types";

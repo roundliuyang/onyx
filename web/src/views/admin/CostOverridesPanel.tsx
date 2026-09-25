@@ -8,7 +8,7 @@ import { Button, Card, InputTypeIn, MessageCard, Text } from "@opal/components";
 import { Hoverable } from "@opal/core";
 import { SvgCheck, SvgEdit, SvgPlus, SvgTrash, SvgX } from "@opal/icons";
 import { markdown } from "@opal/utils";
-import { SimpleModelSelector } from "@/lib/modelSelectors/components";
+import { SimpleModelSelector } from "@/lib/languageModels/components";
 import { getProvider } from "@/lib/languageModels";
 import {
   filterModelConfigurations,

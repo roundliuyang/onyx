@@ -42,7 +42,7 @@ import {
   type Locale,
 } from "@/i18n/config";
 import useUserPersonalization from "@/hooks/useUserPersonalization";
-import { SimpleModelSelector } from "@/lib/modelSelectors/components";
+import { SimpleModelSelector } from "@/lib/languageModels/components";
 import { structureValue } from "@/lib/languageModels/utils";
 import { deleteAllChatSessions } from "@/app/app/services/lib";
 import { useLlmManager } from "@/lib/hooks";

@@ -29,7 +29,7 @@ import InputTypeInElementField from "@/refresh-components/form/InputTypeInElemen
 import InputDatePickerField from "@/refresh-components/form/InputDatePickerField";
 import { Content, InputHorizontal, InputVertical } from "@opal/layouts";
 import { useFormikContext } from "formik";
-import { SimpleModelSelector } from "@/lib/modelSelectors/components";
+import { SimpleModelSelector } from "@/lib/languageModels/components";
 import { useLanguageModelsForAgent } from "@/lib/languageModels/hooks";
 import {
   MAX_CHARACTERS_STARTER_MESSAGE,

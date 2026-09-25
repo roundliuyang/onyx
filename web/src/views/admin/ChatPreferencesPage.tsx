@@ -25,7 +25,7 @@ import {
   InputTypeIn,
   type SelectOption,
 } from "@opal/components";
-import { SimpleModelSelector } from "@/lib/modelSelectors/components";
+import { SimpleModelSelector } from "@/lib/languageModels/components";
 import { findLlmOptionById } from "@/lib/languageModels/options";
 import { useAdminLanguageModels } from "@/lib/languageModels/hooks";
 import { findProviderOwningModelConfig } from "@/lib/languageModels/utils";

@@ -1,6 +1,6 @@
 import React from "react";
 import { render, screen, setupUser } from "@tests/setup/test-utils";
-import SimpleModelSelector from "@/lib/modelSelectors/components/SimpleModelSelector";
+import SimpleModelSelector from "@/lib/languageModels/components/SimpleModelSelector";
 import type { ModelOptionProvider } from "@/lib/languageModels/types";
 
 // The listbox renders through a portal; keep it inside the test container.
