@@ -4,20 +4,16 @@ import { ChangeEvent, useState } from "react";
 import { useLocale, useTranslations } from "next-intl";
 import { useSWRConfig } from "swr";
 import { ContentAction, PageLoader, toast } from "@opal/layouts";
-import {
-  Button,
-  Card,
-  InputTypeIn,
-  MessageCard,
-  OpenButton,
-  Text,
-} from "@opal/components";
+import { Button, Card, InputTypeIn, MessageCard, Text } from "@opal/components";
 import { Hoverable } from "@opal/core";
 import { SvgCheck, SvgEdit, SvgPlus, SvgTrash, SvgX } from "@opal/icons";
 import { markdown } from "@opal/utils";
-import ModelSelector from "@/sections/model-selector/ModelSelector";
+import { SimpleModelSelector } from "@/lib/modelSelectors/components";
 import { getProvider } from "@/lib/languageModels";
-import { LLMOption } from "@/lib/languageModels/options";
+import {
+  filterModelConfigurations,
+  findLlmOptionById,
+} from "@/lib/languageModels/options";
 import { useAdminLLMProviders } from "@/lib/languageModels/hooks";
 import * as GeneralLayouts from "@/layouts/general-layouts";
 import {
@@ -137,21 +133,21 @@ function OverrideForm({ existing, onDone }: OverrideFormProps) {
           {isEdit ? (
             <InputTypeIn value={modelLabel} variant="readOnly" />
           ) : (
-            <ModelSelector
+            <SimpleModelSelector
+              nullable
+              providers={filterModelConfigurations(llmProviders ?? [], {
+                visibleOnly: false,
+              })}
               value={modelConfigId}
-              providerOptions={llmProviders ?? []}
-              includeHiddenModels
-              onChange={(opt: LLMOption) => {
-                setModel(opt.modelName);
-                setProvider(opt.provider);
-                setModelConfigId(opt.modelConfigurationId ?? null);
+              onChange={(modelConfigurationId) => {
+                const opt = findLlmOptionById(
+                  llmProviders,
+                  modelConfigurationId
+                );
+                setModel(opt?.modelName ?? "");
+                setProvider(opt?.provider ?? "");
+                setModelConfigId(modelConfigurationId);
               }}
-              renderTrigger={() => (
-                <OpenButton>
-                  {modelLabel || t("form.model.placeholder")}
-                </OpenButton>
-              )}
-              side="bottom"
             />
           )}
         </div>

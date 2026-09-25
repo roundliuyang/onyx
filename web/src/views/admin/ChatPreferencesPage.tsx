@@ -25,7 +25,8 @@ import {
   InputTypeIn,
   type SelectOption,
 } from "@opal/components";
-import ModelSelector from "@/sections/model-selector/ModelSelector";
+import { SimpleModelSelector } from "@/lib/modelSelectors/components";
+import { findLlmOptionById } from "@/lib/languageModels/options";
 import { useAdminLLMProviders } from "@/lib/languageModels/hooks";
 import { findProviderOwningModelConfig } from "@/lib/languageModels/utils";
 import {
@@ -745,7 +746,7 @@ export default function ChatPreferencesPage() {
   } = useAdminLLMProviders();
 
   // Resolve defaultChatNaming (id + name based) to a model_configuration_id
-  // for ModelSelector.
+  // for the select.
   const chatNamingModelConfigId = useMemo(() => {
     if (!defaultChatNaming || !llmProviders) return null;
     for (const p of llmProviders) {
@@ -1133,14 +1134,20 @@ export default function ChatPreferencesPage() {
                       {t("chatNaming.resetButton.label")}
                     </Button>
                   )}
-                  <ModelSelector
+                  <SimpleModelSelector
+                    providers={llmProviders ?? []}
                     value={chatNamingModelConfigId}
-                    onChange={(opt) =>
+                    onChange={(modelConfigurationId) => {
+                      const opt = findLlmOptionById(
+                        llmProviders,
+                        modelConfigurationId
+                      );
+                      if (!opt) return;
                       void handleChatNamingModelChange({
                         modelName: opt.modelName,
-                        modelConfigurationId: opt.modelConfigurationId,
-                      })
-                    }
+                        modelConfigurationId,
+                      });
+                    }}
                   />
                 </div>
               </InputHorizontal>
