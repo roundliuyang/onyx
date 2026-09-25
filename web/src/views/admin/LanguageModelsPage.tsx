@@ -487,6 +487,9 @@ export default function LanguageModelsPage() {
                     { keep: defaultModelConfigId }
                   )}
                   value={defaultModelConfigId}
+                  grouped={
+                    !(pendingHideGrouping ?? settings.hide_provider_grouping)
+                  }
                   onChange={(modelConfigurationId) => {
                     const opt = findLlmOptionById(
                       existingLlmProviders,

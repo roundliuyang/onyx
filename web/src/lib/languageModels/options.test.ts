@@ -6,6 +6,7 @@ import {
   llmOptionKey,
   toSelectValue,
 } from "@/lib/languageModels/options";
+import type { SelectDivider, SelectOption } from "@opal/components";
 import type {
   LLMProviderDescriptor,
   ModelConfiguration,
@@ -216,11 +217,15 @@ describe("model select options", () => {
   ];
 
   describe("buildModelSelectOptions", () => {
+    // Rows of a divider, or the entry itself when it is a loose row.
+    const rowsOf = (entry: SelectOption | SelectDivider) =>
+      "options" in entry ? entry.options : [entry];
+
     test("renders every model given, hidden ones included, under a divider per provider", () => {
       const dividers = buildModelSelectOptions(providers);
       // A nameless provider groups under its product name.
       expect(dividers.map((d) => d.title)).toEqual(["Claude", "OpenAI"]);
-      expect(dividers[1]?.options.map((o) => [o.value, o.title])).toEqual([
+      expect(rowsOf(dividers[1]!).map((o) => [o.value, o.title])).toEqual([
         ["11", "GPT-4o"],
         ["12", "o3-mini"],
       ]);
@@ -228,10 +233,29 @@ describe("model select options", () => {
 
     test("leaves out models without a configuration id", () => {
       const values = buildModelSelectOptions(providers).flatMap((d) =>
-        d.options.map((o) => o.value)
+        rowsOf(d).map((o) => o.value)
       );
       expect(values).not.toContain("unsaved");
       expect(values).toHaveLength(3);
+    });
+
+    test("dividers fold, and grouping can be turned off", () => {
+      const grouped = buildModelSelectOptions(providers);
+      expect(
+        grouped.every((entry) => "options" in entry && entry.foldable)
+      ).toBe(true);
+      const flat = buildModelSelectOptions(providers, { grouped: false });
+      expect(flat.every((entry) => !("options" in entry))).toBe(true);
+      expect(
+        flat.map((entry) => ("value" in entry ? entry.value : ""))
+      ).toEqual(["21", "11", "12"]);
+    });
+
+    test("a single provider renders flat: a lone header says nothing", () => {
+      const only = providers.filter((p) => p.id === 1);
+      const rows = buildModelSelectOptions(only);
+      expect(rows.every((entry) => !("options" in entry))).toBe(true);
+      expect(rows).toHaveLength(2);
     });
 
     test("an empty list yields no options", () => {

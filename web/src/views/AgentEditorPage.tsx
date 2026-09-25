@@ -422,7 +422,11 @@ export default function AgentEditorPage({
   const canUpdateFeaturedStatus = existingAgent
     ? can(existingAgent, "feature")
     : hasPermission(permissions, Permission.MANAGE_AGENTS);
-  const { vectorDbEnabled, appName } = useSettings();
+  const {
+    vectorDbEnabled,
+    appName,
+    hide_provider_grouping: hideProviderGrouping,
+  } = useSettings();
   const businessTier = useTierAtLeast(Tier.BUSINESS);
   // The providers this agent may use; a new agent gets the unscoped list.
   const { llmProviders: agentLlmProviders } = useLanguageModelsForAgent(
@@ -1670,6 +1674,7 @@ export default function AgentEditorPage({
                                         | number
                                         | null) ?? null
                                     }
+                                    grouped={!hideProviderGrouping}
                                     onChange={(modelConfigurationId) =>
                                       setFieldValue(
                                         "default_model_configuration_id",

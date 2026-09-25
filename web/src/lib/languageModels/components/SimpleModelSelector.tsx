@@ -32,28 +32,38 @@ export interface SimpleModelSelectorProps<Nullable extends boolean = false> {
    * does nothing, and `onChange` never emits null.
    */
   nullable?: Nullable;
+  /**
+   * Group models under a foldable divider per provider. Pass
+   * `!settings.hide_provider_grouping` to honour the admin setting. A
+   * single provider always renders flat.
+   */
+  grouped?: boolean;
 }
 
 /**
  * A form select over model configurations, the plain counterpart of the
- * chat `ModelSelector`: an `InputSingleSelect` with providers as titled
- * dividers and each model a row with its icon. No search, no per-model
- * settings, and nothing chosen shows the placeholder rather than a fallback.
+ * chat `ModelSelector`: an `InputSingleSelect` with a search field,
+ * providers as foldable dividers and each model a row with its icon. No
+ * per-model settings, and nothing chosen shows the placeholder rather than
+ * a fallback.
  */
 export default function SimpleModelSelector<Nullable extends boolean = false>({
   providers,
   value,
   onChange,
   nullable,
+  grouped = true,
 }: SimpleModelSelectorProps<Nullable>) {
   const t = useTranslations("common.modelSelectors");
   const options = useMemo(
-    () => buildModelSelectOptions(providers),
-    [providers]
+    () => buildModelSelectOptions(providers, { grouped }),
+    [providers, grouped]
   );
 
   return (
     <InputSingleSelect
+      // Provider lists run long: the list always carries a search field.
+      search
       value={toSelectValue(value)}
       // A non-nullable field's own value is its floor: a re-pick is a no-op.
       defaultOption={nullable || value === null ? undefined : String(value)}

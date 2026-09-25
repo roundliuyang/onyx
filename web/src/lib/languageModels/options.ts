@@ -1,5 +1,9 @@
 import type { FunctionComponent } from "react";
-import type { SelectDivider, SelectOption } from "@opal/components";
+import type {
+  SelectDivider,
+  SelectOption,
+  SelectOptions,
+} from "@opal/components";
 import type { IconProps } from "@opal/types";
 import {
   LLMProviderDescriptor,
@@ -274,19 +278,31 @@ export function fromSelectValue(value: string): number | null {
   return Number.isInteger(id) ? id : null;
 }
 
+export interface BuildModelSelectOptionsOptions {
+  /**
+   * Group models under a foldable divider per provider (aggregators split
+   * per vendor, as the chat picker does). Off, or with a single group,
+   * the rows come flat: a lone header says nothing, and an admin can hide
+   * grouping workspace-wide. Defaults to true.
+   */
+  grouped?: boolean;
+}
+
 /**
- * Every model configuration given, as Opal options: one titled divider per
- * provider (aggregators split per vendor, as the chat picker does), each
- * model a row with its icon. Nothing is filtered here; callers trim the
- * list first. A model without a configuration id cannot be chosen by id,
- * so it is left out.
+ * Every model configuration given, as Opal options, each model a row with
+ * its icon. Nothing is filtered here; callers trim the list first. A model
+ * without a configuration id cannot be chosen by id, so it is left out.
  */
 export function buildModelSelectOptions(
-  providers: ModelOptionProvider[]
-): SelectDivider[] {
-  return groupLlmOptions(buildLlmOptions(providers, undefined, true))
+  providers: ModelOptionProvider[],
+  { grouped = true }: BuildModelSelectOptionsOptions = {}
+): SelectOptions {
+  const dividers: SelectDivider[] = groupLlmOptions(
+    buildLlmOptions(providers, undefined, true)
+  )
     .map((group) => ({
       title: group.displayName,
+      foldable: true,
       options: group.options.flatMap((option): SelectOption[] =>
         option.modelConfigurationId == null
           ? []
@@ -300,4 +316,6 @@ export function buildModelSelectOptions(
       ),
     }))
     .filter((divider) => divider.options.length > 0);
+  if (grouped && dividers.length > 1) return dividers;
+  return dividers.flatMap((divider) => divider.options);
 }

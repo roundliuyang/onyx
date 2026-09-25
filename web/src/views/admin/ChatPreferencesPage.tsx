@@ -1142,6 +1142,7 @@ export default function ChatPreferencesPage() {
                       keep: chatNamingModelConfigId,
                     })}
                     value={chatNamingModelConfigId}
+                    grouped={!settings.hide_provider_grouping}
                     onChange={(modelConfigurationId) => {
                       const opt = findLlmOptionById(
                         llmProviders,

@@ -15,6 +15,7 @@ import {
   findLlmOptionById,
 } from "@/lib/languageModels/options";
 import { useAdminLanguageModels } from "@/lib/languageModels/hooks";
+import { useSettings } from "@/lib/settings/hooks";
 import * as GeneralLayouts from "@/layouts/general-layouts";
 import {
   deleteCostOverride,
@@ -59,6 +60,7 @@ function OverrideForm({ existing, onDone }: OverrideFormProps) {
   const t = useTranslations("admin.costOverrides");
   const { mutate } = useSWRConfig();
   const { llmProviders } = useAdminLanguageModels();
+  const { hide_provider_grouping: hideProviderGrouping } = useSettings();
   const [model, setModel] = useState(existing?.model ?? "");
   const [provider, setProvider] = useState(existing?.provider ?? "");
   const [inputRate, setInputRate] = useState(
@@ -139,6 +141,7 @@ function OverrideForm({ existing, onDone }: OverrideFormProps) {
                 visibleOnly: false,
               })}
               value={modelConfigId}
+              grouped={!hideProviderGrouping}
               onChange={(modelConfigurationId) => {
                 const opt = findLlmOptionById(
                   llmProviders,

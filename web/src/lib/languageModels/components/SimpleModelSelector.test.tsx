@@ -66,7 +66,9 @@ describe("SimpleModelSelector", () => {
     expect(screen.getByRole("combobox")).toHaveValue("GPT-4o");
 
     await user.click(screen.getByRole("combobox"));
-    expect(screen.getByText("OpenAI")).toBeInTheDocument();
+    // One provider: no divider, and the list carries a search field.
+    expect(screen.queryByText("OpenAI")).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Search" })).toHaveFocus();
     await user.click(screen.getByRole("option", { name: /GPT-4\.1/ }));
     expect(handleChange).toHaveBeenCalledWith(12);
   });
@@ -101,6 +103,56 @@ describe("SimpleModelSelector", () => {
     await user.click(screen.getByRole("combobox"));
     await user.click(screen.getByRole("option", { name: /GPT-4o/ }));
     expect(handleChange).toHaveBeenCalledWith(null);
+  });
+
+  test("groups several providers under foldable dividers, the chosen one open", async () => {
+    const user = setupUser();
+    const two: ModelOptionProvider[] = [
+      ...providers,
+      {
+        id: 2,
+        name: null,
+        provider: "anthropic",
+        model_configurations: [
+          {
+            id: 21,
+            name: "claude-sonnet-4",
+            is_visible: true,
+            max_input_tokens: null,
+            supports_image_input: false,
+            supports_reasoning: false,
+            effectiveDisplayName: "Claude Sonnet 4",
+          },
+        ],
+      },
+    ];
+    render(
+      <SimpleModelSelector providers={two} value={21} onChange={jest.fn()} />
+    );
+    await user.click(screen.getByRole("combobox"));
+    expect(screen.getByText("OpenAI")).toBeInTheDocument();
+    expect(screen.getByText("Claude")).toBeInTheDocument();
+    expect(
+      screen.getByRole("option", { name: /Claude Sonnet 4/ })
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("option", { name: /GPT-4o/ })
+    ).not.toBeInTheDocument();
+  });
+
+  test("grouped=false renders every provider's models flat", async () => {
+    const user = setupUser();
+    render(
+      <SimpleModelSelector
+        providers={providers}
+        value={11}
+        onChange={jest.fn()}
+        grouped={false}
+      />
+    );
+    await user.click(screen.getByRole("combobox"));
+    expect(screen.queryByText("OpenAI")).not.toBeInTheDocument();
+    expect(screen.getAllByRole("option")).toHaveLength(2);
   });
 
   test("renders an empty list without options", async () => {
