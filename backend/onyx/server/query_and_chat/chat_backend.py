@@ -772,8 +772,8 @@ def end_incognito_session(
             logger.exception("Incognito teardown could not %s for %s", what, session_id)
 
 
-# NOTE: This endpoint is extremely central to the application, any changes to it should be reviewed and approved by an experienced
-# team member. It is very important to 1. avoid bloat and 2. that this remains backwards compatible across versions.
+# 注意：此接口是应用的核心，修改需由经验丰富的团队成员审核批准。
+# 应避免代码膨胀，并保持跨版本的向后兼容性。
 @router.post(
     "/send-chat-message",
     response_model=ChatFullResponse,
@@ -808,26 +808,27 @@ def handle_send_chat_message(
     _api_key_usage_check: None = Depends(check_api_key_usage),
 ) -> StreamingResponse | ChatFullResponse:
     """
-    This endpoint is used to send a new chat message.
+    发送新的聊天消息，根据请求配置返回流式响应或完整结果。
 
-    Args:
-        chat_message_req (SendMessageRequest): Details about the new chat message.
-            - When stream=True (default): Returns StreamingResponse with SSE
-            - When stream=False: Returns ChatFullResponse with complete data
-        request (Request): The current HTTP request context.
-        user (User): The current user, obtained via dependency injection.
-        _ (None): Rate limit check is run if user/group/global rate limits are enabled.
+    参数：
+        chat_message_req (SendMessageRequest)：新消息及其配置。
+            - stream=True（默认）：返回 StreamingResponse 流式响应。
+            - stream=False：返回包含完整结果的 ChatFullResponse。
+        request (Request)：当前 HTTP 请求，用于读取认证信息和透传请求头。
+        user (User)：通过依赖注入获取的当前用户，允许匿名访问。
+        _rate_limit_check (None)：依赖注入执行令牌用量限流检查。
+        _api_key_usage_check (None)：依赖注入执行 API 密钥用量检查。
 
-    Returns:
-        StreamingResponse | ChatFullResponse: Either streams or returns complete response.
+    返回：
+        StreamingResponse | ChatFullResponse：流式响应或完整聊天结果。
     """
-    # Session id only: the session's incognito mode isn't loaded yet, and a
-    # verbatim prompt in the debug log would be exactly the durable message
-    # log incognito must never leave behind.
+    # 此时尚未加载会话的无痕模式设置，因此只记录会话 ID。
+    # 不记录提示词原文，避免无痕消息留存在持久化日志中。
     logger.debug(
         "Received new chat message for session %s", chat_message_req.chat_session_id
     )
 
+    # 查询事件按租户记录；匿名用户使用租户 ID，其他用户使用用户 ID。
     tenant_id = get_current_tenant_id()
     mt_cloud_telemetry(
         tenant_id=tenant_id,
@@ -835,22 +836,24 @@ def handle_send_chat_message(
         event=MilestoneRecordType.RAN_QUERY,
     )
 
-    # Override origin to API when authenticated via API key or PAT
-    # to prevent clients from polluting telemetry data
+    # 使用 API 密钥或个人访问令牌（PAT）认证时，强制将来源标记为 API。
+    # 避免客户端提供的来源信息影响遥测统计。
     if get_hashed_api_key_from_request(request) or get_hashed_pat_from_request(request):
         chat_message_req.origin = MessageOrigin.API
 
-    # Multi-model streaming path: 2-3 LLMs in parallel (streaming only)
+    # 多模型分支：并行调用 2 至 3 个大语言模型，仅支持流式响应。
     is_multi_model = (
         chat_message_req.llm_overrides is not None
         and len(chat_message_req.llm_overrides) > 1
     )
     if is_multi_model and chat_message_req.stream:
-        # Narrowed here; is_multi_model already checked llm_overrides is not None
+        # 仅流式多模型请求进入这里，并通过专用生成器合并多个模型的输出。
+        # 上面的条件已排除 None；这里让类型检查器明确识别列表类型。
         llm_overrides = chat_message_req.llm_overrides or []
 
         def multi_model_stream_generator() -> Generator[str, None, None]:
             try:
+                # 调用多模型流式处理器，并把模型、工具和 MCP 所需的请求头透传下去。
                 for obj in handle_multi_model_stream(
                     new_msg_req=chat_message_req,
                     user=user,
@@ -863,8 +866,12 @@ def handle_send_chat_message(
                     ),
                     mcp_headers=chat_message_req.mcp_headers,
                 ):
+                    # 每个事件立即写出，避免等待所有模型都完成后再返回。
+                    # 将事件对象序列化为一行 JSON，供客户端逐行解析。
                     yield get_json_line(obj.model_dump())
             except Exception as e:
+                # 生成器内部不能再改 HTTP 状态码，只能把错误作为流式数据返回。
+                # 流式响应中的处理异常通过错误数据返回给客户端。
                 logger.exception("Error in multi-model streaming")
                 yield json.dumps({"error": str(e)})
 
@@ -872,14 +879,16 @@ def handle_send_chat_message(
             multi_model_stream_generator(), media_type="text/event-stream"
         )
 
+    # 在创建响应前拒绝不支持的多模型非流式请求。
     if is_multi_model and not chat_message_req.stream:
         raise OnyxError(
             OnyxErrorCode.INVALID_INPUT,
             "Multi-model mode (llm_overrides with >1 entry) requires stream=True.",
         )
 
-    # Non-streaming path: consume all packets and return complete response
+    # 非流式分支：收集全部事件，再返回完整响应。
     if not chat_message_req.stream:
+        # 启用用量限制时，先检查本次调用是否超额，再计数并提交。
         if is_usage_limits_enabled():
             with get_session_with_current_tenant() as usage_db_session:
                 check_usage_and_raise(
@@ -895,6 +904,7 @@ def handle_send_chat_message(
                 )
                 usage_db_session.commit()
 
+        # 状态容器在消息处理和结果汇总之间共享会话状态。
         state_container = ChatStateContainer()
         packets = handle_stream_message_objects(
             new_msg_req=chat_message_req,
@@ -910,10 +920,8 @@ def handle_send_chat_message(
             external_state_container=state_container,
         )
         result = gather_stream_full(packets, state_container)
-        # CreateChatSessionID is only yielded for newly-created sessions, so for
-        # follow-up messages on an existing session the aggregated response would
-        # otherwise omit chat_session_id. Backfill it from the request so the
-        # field is always present for non-streaming clients.
+        # 仅新建会话会产生 CreateChatSessionID 事件。
+        # 现有会话的后续消息需从请求补入会话 ID，避免汇总结果缺少该字段。
         if (
             result.chat_session_id is None
             and chat_message_req.chat_session_id is not None
@@ -921,7 +929,7 @@ def handle_send_chat_message(
             result.chat_session_id = chat_message_req.chat_session_id
         return result
 
-    # Streaming path, normal Onyx UI behavior
+    # 单模型流式分支：Onyx 界面通常使用此路径，逐个返回事件。
     def stream_generator() -> Generator[str, None, None]:
         state_container = ChatStateContainer()
         try:
@@ -938,9 +946,11 @@ def handle_send_chat_message(
                 additional_context=chat_message_req.additional_context,
                 external_state_container=state_container,
             ):
+                # 响应类型为 text/event-stream，数据按逐行 JSON 格式输出。
                 yield get_json_line(obj.model_dump())
 
         except Exception as e:
+            # 记录完整异常，并通过流返回错误信息。
             logger.exception("Error in chat message streaming")
             yield json.dumps({"error": str(e)})
 

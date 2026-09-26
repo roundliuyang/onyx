@@ -100,67 +100,75 @@ class ChatFeedbackRequest(BaseModel):
         return self
 
 
-# NOTE: This model is used for the core flow of the Onyx application, any changes to it should be reviewed and approved by an
-# experienced team member. It is very important to 1. avoid bloat and 2. that this remains backwards compatible across versions.
+# 注意：此模型用于 Onyx 的核心流程，修改需由经验丰富的团队成员审核批准。
+# 应避免字段和逻辑膨胀，并保持跨版本的向后兼容性。
 class SendMessageRequest(BaseModel):
+    # 用户发送的消息正文。
     message: str
 
+    # 覆盖本次请求使用的单模型配置。
     llm_override: LLMOverride | None = None
-    # For multi-model mode: up to 3 LLM overrides to run in parallel.
-    # When provided with >1 entry, triggers multi-model streaming.
+    # 多模型配置：最多并行调用 3 个模型。
+    # 提供超过 1 项配置时，进入多模型流式处理流程。
     llm_overrides: list[LLMOverride] | None = None
-    # Test-only override for deterministic LiteLLM mock responses.
+    # 仅用于测试，为 LiteLLM 指定固定的模拟响应。
     mock_llm_response: str | None = None
 
+    # 限定本次请求可用的工具 ID。
     allowed_tool_ids: list[int] | None = None
+    # 指定本次请求要强制调用的工具，具体执行仍受工具可用性检查约束。
     forced_tool_id: int | None = None
 
+    # 本次消息附带的文件描述信息，不直接存放文件内容。
     file_descriptors: list[FileDescriptor] = []
 
+    # 内部文档检索使用的筛选条件。
     internal_search_filters: BaseFilters | None = None
 
+    # 是否启用深度研究模式。
     deep_research: bool = False
 
-    # Headers to forward to MCP tool calls (e.g., user JWT token, user ID)
-    # Example: {"Authorization": "Bearer <user_jwt>", "X-User-ID": "user123"}
+    # 透传给 MCP 工具调用的请求头，例如用户 JWT 令牌和用户 ID。
+    # 示例：{"Authorization": "Bearer <user_jwt>", "X-User-ID": "user123"}
     mcp_headers: dict[str, str] | None = None
 
-    # Origin of the message for telemetry tracking
+    # 消息来源，用于遥测统计。
     origin: MessageOrigin = MessageOrigin.UNSET
 
-    # Placement information for the message in the conversation tree:
-    # - -1: auto-place after latest message in chain
-    # - null: regeneration from root (first message)
-    # - positive int: place after that specific parent message
-    # NOTE: for regeneration, this is the only case currently where there is branching on the user message.
-    # If the message of parent_message_id is a user message, the message will be ignored and it will use the
-    # original user message for regeneration.
+    # 指定消息在对话树中的位置：
+    # - -1：自动接在当前消息链的最新消息之后。
+    # - null：从根节点重新生成，即从第一条消息开始。
+    # - 正整数：接在指定的父消息之后。
+    # 重新生成是目前唯一会在用户消息处产生分支的场景。
+    # 如果父消息是用户消息，则忽略本次请求的 message，使用原用户消息重新生成。
     parent_message_id: int | None = AUTO_PLACE_AFTER_LATEST_MESSAGE
+    # 继续现有会话时提供其 ID，与 chat_session_info 互斥。
     chat_session_id: UUID | None = None
+    # 创建新会话时使用的配置；两个会话字段均未提供时，使用默认配置。
     chat_session_info: ChatSessionCreationRequest | None = None
 
-    # When True (default), returns StreamingResponse with SSE
-    # When False, returns ChatFullResponse with complete data
+    # True（默认）：返回 StreamingResponse 流式响应。
+    # False：返回包含完整结果的 ChatFullResponse。
     stream: bool = True
 
-    # When False, disables citation generation:
-    # - Citation markers like [1], [2] are removed from response text
-    # - No CitationInfo packets are emitted during streaming
+    # False 表示禁用引用生成：
+    # - 从响应正文中移除 [1]、[2] 等引用标记。
+    # - 流式响应中不再发送 CitationInfo 数据包。
     include_citations: bool = True
 
-    # Additional context injected into the LLM call but NOT stored in the DB
-    # (not shown in chat history). Used e.g. by the Chrome extension to pass
-    # the current tab URL when "Read this tab" is enabled.
+    # 注入模型调用的额外上下文，不写入数据库，也不显示在聊天历史中。
+    # 例如：Chrome 扩展启用“读取此标签页”时，可用此字段传入当前标签页的 URL。
     additional_context: str | None = None
 
+    # 在字段校验完成后，检查会话 ID 与新建会话配置的组合。
     @model_validator(mode="after")
     def check_chat_session_id_or_info(self) -> "SendMessageRequest":
-        # If neither is provided, default to creating a new chat session using the
-        # default ChatSessionCreationRequest values.
+        # 两者均未提供时，返回带有默认新建会话配置的模型副本。
         if self.chat_session_id is None and self.chat_session_info is None:
             return self.model_copy(
                 update={"chat_session_info": ChatSessionCreationRequest()}
             )
+        # 不能同时指定现有会话和新建会话配置。
         if self.chat_session_id is not None and self.chat_session_info is not None:
             raise ValueError(
                 "Only one of chat_session_id or chat_session_info should be provided, not both."

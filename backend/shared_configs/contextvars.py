@@ -4,7 +4,9 @@ from typing import NamedTuple
 from shared_configs.configs import MULTI_TENANT, POSTGRES_DEFAULT_SCHEMA
 from shared_configs.enums import UsageCredentialType
 
-# Context variable for the current tenant id
+# 保存当前执行上下文的租户 ID，值的类型为字符串或 None。
+# 多租户模式默认值为 None，需由调用方设置租户 ID；
+# 单租户模式默认使用 PostgreSQL 的默认 schema 名称。
 CURRENT_TENANT_ID_CONTEXTVAR: contextvars.ContextVar[str | None] = (
     contextvars.ContextVar(
         "current_tenant_id", default=None if MULTI_TENANT else POSTGRES_DEFAULT_SCHEMA
@@ -70,13 +72,17 @@ CURRENT_USAGE_CREDENTIAL_CONTEXTVAR: contextvars.ContextVar[
 
 
 def get_current_tenant_id() -> str:
+    # 从当前执行上下文读取租户 ID。
     tenant_id = CURRENT_TENANT_ID_CONTEXTVAR.get()
     if tenant_id is None:
         import traceback
 
+        # 单租户模式下，未设置租户 ID 时使用默认的 PostgreSQL schema。
         if not MULTI_TENANT:
             return POSTGRES_DEFAULT_SCHEMA
 
+        # 多租户模式必须明确指定租户，不能回退到默认 schema。
+        # 将当前调用栈附加到异常信息中，便于定位租户上下文缺失的位置。
         stack_trace = traceback.format_stack()
         error_message = (
             "Tenant ID is not set. This should never happen.\nStack trace:\n"

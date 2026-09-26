@@ -163,10 +163,16 @@ def mt_cloud_telemetry(
     event: MilestoneRecordType,
     properties: dict[str, Any] | None = None,
 ) -> None:
+    """上报 Onyx 多租户云环境的里程碑事件。
+
+    单租户部署直接返回，不发送事件。函数会把 tenant_id 写入事件属性，
+    用于后续按租户分析遥测数据。
+    """
+    # 仅多租户云环境需要上报这些事件。
     if not MULTI_TENANT:
         return
 
-    # Automatically include tenant_id in properties
+    # 自动把 tenant_id 合并到属性中，确保事件始终可按租户归属。
     all_properties = {**properties} if properties else {}
     if properties and "tenant_id" in properties:
         logger.warning(
@@ -176,9 +182,8 @@ def mt_cloud_telemetry(
         )
     all_properties["tenant_id"] = tenant_id
 
-    # MIT version should not need to include any Posthog code
-    # This is only for Onyx MT Cloud, this code should also never be hit, no reason for any orgs to
-    # be running the Multi Tenant version of Onyx.
+    # MIT 版本不需要包含任何 PostHog 代码。
+    # 此逻辑仅供 Onyx 多租户云版本使用；其他部署通常不应走到这里。
     fetch_versioned_implementation_with_fallback(
         module="onyx.utils.telemetry",
         attribute="event_telemetry",
