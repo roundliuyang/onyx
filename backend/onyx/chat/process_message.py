@@ -602,33 +602,36 @@ def build_chat_turn(
     new_msg_req: SendMessageRequest,
     user: User,
     db_session: Session,
-    # None → single-model (persona default LLM); non-empty list → multi-model (one LLM per override)
+    # None 表示单模型，使用 persona 默认 LLM；非空列表表示多模型，每个覆盖项对应一个 LLM。
     llm_overrides: list[LLMOverride] | None,
     *,
     litellm_additional_headers: dict[str, str] | None = None,
     custom_tool_additional_headers: dict[str, str] | None = None,
     mcp_headers: dict[str, str] | None = None,
-    # Slack context for federated Slack search
+    # Slack 联邦搜索使用的上下文。
     slack_context: SlackContext | None = None,
-    # Additional context to include in the chat history, e.g. Slack threads where the
-    # conversation cannot be represented by a chain of User/Assistant messages.
-    # NOTE: not stored in the database, only passed in to the LLM as context
+    # 注入聊天历史的额外上下文，例如无法表示为用户/助手消息链的 Slack 线程。
+    # 注意：此字段不写入数据库，只作为上下文传给 LLM。
     additional_context: str | None = None,
 ) -> Generator[AnswerStreamPart, None, ChatTurnSetup]:
-    """Shared setup generator for both single-model and multi-model chat turns.
+    """单模型和多模型聊天轮次共用的初始化生成器。
 
-    Yields the packet(s) the frontend needs for request tracking, then returns an
-    immutable ``ChatTurnSetup`` containing everything the execution strategy needs.
+    这是聊天产品主流程的编排层。它不会直接运行模型，而是在一轮对话开跑前，
+    按业务顺序串起会话、权限、遥测、模型、文件、历史、hook、无痕模式、
+    摘要、记忆、token 预算、工具、消息 ID 和处理状态等准备工作。
 
-    Callers use::
+    先产出前端用于追踪请求的数据包，再返回不可变的 ``ChatTurnSetup``。
+    该对象包含后续执行策略需要的全部上下文。
+
+    调用方使用如下形式：
 
         setup = yield from build_chat_turn(new_msg_req, ..., llm_overrides=...)
 
-    to forward yielded packets upstream while receiving the return value locally.
+    这样可以把产出的数据包继续向上游转发，同时在本地接收返回值。
 
-    Args:
-        llm_overrides: ``None`` → single-model (persona default LLM).
-                       Non-empty list → multi-model (one LLM per override).
+    参数：
+        llm_overrides：``None`` 表示单模型，使用 persona 默认 LLM。
+            非空列表表示多模型，每个覆盖项对应一个 LLM。
     """
     tenant_id = get_current_tenant_id()
     is_multi = bool(llm_overrides)
@@ -638,7 +641,7 @@ def build_chat_turn(
         "anonymous_user" if user.is_anonymous else (user.email or str(user_id))
     )
 
-    # ── Session resolution ───────────────────────────────────────────────────
+    # ── 会话解析与创建 ─────────────────────────────────────────────────────
     if not new_msg_req.chat_session_id:
         if not new_msg_req.chat_session_info:
             raise RuntimeError("Must specify a chat session id or chat session info")
@@ -672,7 +675,8 @@ def build_chat_turn(
         user_id=llm_user_identifier, session_id=str(chat_session.id)
     )
 
-    # Milestone tracking, most devs using the API don't need to understand this
+    # ── 匿名身份与遥测埋点 ────────────────────────────────────────────────
+    # 里程碑事件统计；普通 API 调用方通常不需要关心这部分。
     mt_cloud_telemetry(
         tenant_id=tenant_id,
         distinct_id=str(user.id) if not user.is_anonymous else tenant_id,
@@ -691,8 +695,8 @@ def build_chat_turn(
         },
     )
 
-    # Check LLM cost limits before using the LLM (only for Onyx-managed keys),
-    # then build the LLM instance(s).
+    # ── LLM 成本校验与模型实例构建 ───────────────────────────────────────
+    # 使用 LLM 前先检查成本限制（仅针对 Onyx 托管密钥），再构建 LLM 实例。
     llms: list[LLM] = []
     model_display_names: list[str] = []
     selected_overrides: list[LLMOverride | None] = (
@@ -700,8 +704,8 @@ def build_chat_turn(
         if is_multi
         else [new_msg_req.llm_override or chat_session.llm_override]
     )
-    # Provider-keyed so the factory can apply it to whichever provider the
-    # persona resolution lands on, with final precedence over other sources.
+    # 按 provider 设置策略，便于工厂在 persona 解析出的 provider 上应用。
+    # 该策略的优先级高于其他来源。
     incognito_policy_fn = partial(
         incognito_llm_request_policy, chat_session.incognito_record_mode
     )
@@ -722,7 +726,8 @@ def build_chat_turn(
         model_display_names.append(_build_model_display_name(override, llm))
     token_counter = get_llm_token_counter(llms[0])
 
-    # Verify that the user-specified files actually belong to the user
+    # ── 文件归属校验与历史消息链重建 ─────────────────────────────────────
+    # 校验请求中指定的文件确实属于当前用户。
     verify_user_files(
         user_files=new_msg_req.file_descriptors,
         user_id=user_id,
@@ -730,15 +735,16 @@ def build_chat_turn(
         project_id=chat_session.project_id,
     )
 
-    # Re-create linear history of messages
+    # 重新构建当前分支上的线性消息历史。
     chat_history = create_chat_history_chain(
         chat_session_id=chat_session.id, db_session=db_session
     )
 
-    # Determine the parent message based on the request:
-    # - AUTO_PLACE_AFTER_LATEST_MESSAGE (-1): auto-place after latest message in chain
-    # - None or root ID: regeneration from root (first message)
-    # - positive int: place after that specific parent message
+    # ── 分支、重新生成与历史截断 ─────────────────────────────────────────
+    # 根据请求确定父消息：
+    # - AUTO_PLACE_AFTER_LATEST_MESSAGE (-1)：自动接到当前消息链的最新消息之后。
+    # - None 或根消息 ID：从根节点重新生成，即从第一条消息开始。
+    # - 正整数：接到指定父消息之后。
     root_message = get_or_create_root_message(
         chat_session_id=chat_session.id, db_session=db_session
     )
@@ -749,7 +755,7 @@ def build_chat_turn(
         new_msg_req.parent_message_id is None
         or new_msg_req.parent_message_id == root_message.id
     ):
-        # Regeneration from root — clear history so we start fresh
+        # 从根节点重新生成时清空历史，后续按全新上下文处理。
         parent_message = root_message
         chat_history = []
     else:
@@ -757,7 +763,7 @@ def build_chat_turn(
         for i in range(len(chat_history) - 1, -1, -1):
             if chat_history[i].id == new_msg_req.parent_message_id:
                 parent_message = chat_history[i]
-                # Truncate to only messages up to and including the parent
+                # 只保留父消息及其之前的历史。
                 chat_history = chat_history[: i + 1]
                 break
 
@@ -766,14 +772,14 @@ def build_chat_turn(
             "The new message sent is not on the latest mainline of messages"
         )
 
-    # ── Query Processing hook + user message ─────────────────────────────────
-    # Skipped on regeneration (parent is USER type): message already exists/was accepted.
+    # ── 查询处理 hook、用户消息与无痕落库策略 ───────────────────────────
+    # 重新生成时父消息是用户消息，说明该消息已存在或已被接受，因此跳过。
     if parent_message.message_type == MessageType.USER:
         user_message = parent_message
     else:
-        # Runs only for new, non-blank messages: regeneration already processed
-        # this text, and SendMessageRequest.message has no min_length guard. The
-        # hook ships the query and user email out, so egress-suppressing modes skip it.
+        # 仅对新的非空消息执行 hook。
+        # 重新生成已处理过这段文本，而 SendMessageRequest.message 没有 min_length 保护。
+        # hook 会把查询和用户邮箱发出，因此禁止外发的模式会跳过。
         mode = chat_session.incognito_record_mode
         if message_text.strip() and (mode is None or mode.fires_hooks):
             hook_result = execute_hook(
@@ -781,9 +787,8 @@ def build_chat_turn(
                 hook_point=HookPoint.QUERY_PROCESSING,
                 payload=QueryProcessingPayload(
                     query=message_text,
-                    # Pass None for anonymous users or authenticated users without an email
-                    # (e.g. some SSO flows). QueryProcessingPayload.user_email is str | None,
-                    # so None is accepted and serialised as null in both cases.
+                    # 匿名用户或没有邮箱的认证用户传 None，例如部分 SSO 流程。
+                    # QueryProcessingPayload.user_email 是 str | None，会序列化为 null。
                     user_email=None if user.is_anonymous else user.email,
                     chat_session_id=str(chat_session.id),
                 ).model_dump(),
@@ -793,14 +798,12 @@ def build_chat_turn(
                 hook_result, message_text
             )
 
-        # Store with the model-agnostic default tokenizer (same convention as
-        # assistant/summary rows in save_chat.py) so budget math sums a single
-        # unit even after mid-session model switches.
+        # 使用与模型无关的默认 tokenizer 存储 token 数。
+        # 这与 save_chat.py 中助手和摘要行的约定一致，避免会话中途换模型后预算单位不一致。
         default_tokenizer = get_tokenizer(None, None)
         user_token_count = len(default_tokenizer.encode(message_text))
-        # Incognito keeps the row for tracking (id, tokens, structure) but its
-        # text lives in the ephemeral store, never in Postgres. Token count is
-        # from the real text so usage and budgeting are unaffected.
+        # 无痕模式仍保留行用于追踪 ID、token 和结构。
+        # 文本只保存在临时存储中，不写入 Postgres；token 数仍来自真实文本。
         keeps_content = record_mode_persists_content(mode)
         user_message = create_new_chat_message(
             chat_session_id=chat_session.id,
@@ -818,9 +821,8 @@ def build_chat_turn(
         )
         chat_history.append(user_message)
 
-    # Collect file IDs for the file reader tool *before* summary truncation so
-    # that files attached to older (summarized-away) messages are still accessible
-    # via the FileReaderTool.
+    # ── 摘要压缩与遗忘文件元数据 ─────────────────────────────────────────
+    # 在摘要截断前收集文件 ID，确保较早消息中的文件仍可被 FileReaderTool 访问。
     available_files = _collect_available_file_ids(
         chat_history=chat_history,
         project_id=chat_session.project_id,
@@ -828,11 +830,10 @@ def build_chat_turn(
         db_session=db_session,
     )
 
-    # Find applicable summary for the current branch
+    # 查找当前消息分支可用的摘要。
     summary_message = find_summary_for_branch(db_session, chat_history)
-    # Collect file metadata from messages that will be dropped by summary truncation.
-    # These become "pre-summarized" file metadata so the forgotten-file mechanism can
-    # still tell the LLM about them.
+    # 收集会被摘要截断丢弃的消息中的文件元数据。
+    # 这些元数据会作为“已摘要前文件”保留，供遗忘文件机制继续告知 LLM。
     summarized_file_metadata: dict[str, FileToolMetadata] = {}
     if summary_message and summary_message.last_summarized_message_id:
         cutoff_id = summary_message.last_summarized_message_id
@@ -846,40 +847,36 @@ def build_chat_turn(
                 summarized_file_metadata[file_id] = FileToolMetadata(
                     file_id=file_id,
                     filename=fd.get("name") or "unknown",
-                    # We don't know the exact size without loading the file,
-                    # but 0 signals "unknown" to the LLM.
+                    # 不加载文件就无法知道准确大小；0 表示大小未知。
                     approx_char_count=0,
-                    # These messages are filtered out of chat_history just
-                    # below, so load_all_chat_files never sees them and the
-                    # bytes never reach chat_files_for_tools.
+                    # 这些消息马上会从 chat_history 中过滤掉。
+                    # load_all_chat_files 看不到它们，文件字节也不会进入 chat_files_for_tools。
                     staged_for_tools=False,
                 )
-        # Filter chat_history to only messages after the cutoff
+        # 只保留摘要截断点之后的聊天历史。
         chat_history = [m for m in chat_history if m.id > cutoff_id]
 
-    # Compute skip-clarification flag for deep research path (cheap, always available)
+    # 为深度研究路径计算是否跳过澄清问题；此检查成本低且始终可用。
     skip_clarification = is_last_assistant_message_clarification(chat_history)
 
+    # ── 用户记忆与 token 预算预留 ────────────────────────────────────────
     user_memory_context = get_memories(user, db_session)
 
-    # This prompt may come from the Agent or Project. Fetched here (before run_llm_loop)
-    # because the inner loop shouldn't need to access the DB-form chat history, but we
-    # need it early for token reservation.
+    # 该提示词可能来自 Agent 或 Project。
+    # 这里提前获取，避免内部 LLM 循环访问数据库形式的聊天历史，并用于 token 预留。
     custom_agent_prompt = get_custom_agent_prompt(persona, chat_session)
 
-    # When use_memories is disabled, strip memories from the prompt context but keep
-    # user info/preferences. The full context is still passed to the LLM loop for
-    # memory tool persistence.
+    # 关闭 use_memories 时，从提示词上下文中移除记忆，但保留用户信息和偏好。
+    # 完整上下文仍传给 LLM 循环，用于记忆工具持久化。
     prompt_memory_context = (
         user_memory_context
         if user.use_memories
         else user_memory_context.without_memories()
     )
 
-    # ── Token reservation ────────────────────────────────────────────────────
-    # Reserve against the placeholder-substituted text — the same final form
-    # run_llm_loop sends to the model — so long directory values can't
-    # invalidate the reservation.
+    # ── Token 预留 ──────────────────────────────────────────────────────────
+    # 基于占位符替换后的最终文本预留 token。
+    # run_llm_loop 会把同样形式的文本发给模型，避免长目录值破坏预算。
     max_reserved_system_prompt_tokens_str = substitute_user_placeholders(
         (persona.system_prompt or "") + (custom_agent_prompt or ""),
         user_memory_context.user_info.placeholder_values,
@@ -892,9 +889,9 @@ def build_chat_turn(
         user_memory_context=prompt_memory_context,
     )
 
-    # Determine which user files to use. A custom persona fully supersedes the project —
-    # project files are never loaded or searchable when a custom persona is in play.
-    # Only the default persona inside a project uses the project's files.
+    # ── 搜索参数、工具上下文与强制工具 ───────────────────────────────────
+    # 确定本轮要使用哪些用户文件。
+    # 自定义 persona 会完全覆盖项目文件；只有项目内默认 persona 会使用项目文件。
     context_user_files = resolve_context_user_files(
         persona=persona,
         project_id=chat_session.project_id,
@@ -902,7 +899,7 @@ def build_chat_turn(
         db_session=db_session,
     )
 
-    # Use the smallest context window across models for safety (harmless for N=1).
+    # 使用所有模型中最小的上下文窗口，保证多模型场景安全；单模型时也无副作用。
     llm_max_context_window = min(llm.config.max_input_tokens for llm in llms)
 
     extracted_context_files = extract_context_files(
@@ -918,7 +915,7 @@ def build_chat_turn(
         extracted_context_files=extracted_context_files,
     )
 
-    # Also grant access to persona-attached user files for FileReaderTool
+    # FileReaderTool 也需要访问 persona 绑定的用户文件。
     if persona.user_files:
         existing = set(available_files.user_file_ids)
         for uf in persona.user_files:
@@ -941,16 +938,15 @@ def build_chat_turn(
     ):
         forced_tool_id = None
 
-    # construct_tools skips disabled tools, and a forced id it did not build fails
-    # the whole message. Callers name the forced tool from the persona's attached
-    # tools, which stay attached when an admin disables one.
+    # construct_tools 会跳过禁用工具；如果强制工具未被构建，整条消息会失败。
+    # persona 绑定的工具被管理员禁用后仍保持绑定，因此这里先清掉禁用工具 ID。
     if forced_tool_id in {tool.id for tool in all_tools if not tool.enabled}:
         forced_tool_id = None
 
-    # TODO(nmgarza5): Once summarization is done, we don't need to load all files from the beginning.
-    # Load all files needed for this chat chain into memory.
+    # TODO(nmgarza5)：摘要流程完善后，不再需要从头加载所有文件。
+    # 将当前聊天链需要的所有文件加载到内存中。
     files = load_all_chat_files(chat_history, db_session)
-    # Convert loaded files to ChatFile format for tools like PythonTool
+    # 转换为 PythonTool 等工具需要的 ChatFile 格式。
     chat_files_for_tools = _convert_loaded_files_to_chat_files(files)
     chat_files_for_tools.extend(
         _load_context_user_files_for_tools(
@@ -959,7 +955,7 @@ def build_chat_turn(
         )
     )
 
-    # ── Reserve assistant message ID(s) → yield to frontend ──────────────────
+    # ── 预留助手消息 ID，并返回给前端 ───────────────────────────────────
     if is_multi:
         assert llm_overrides is not None
         reserved_messages = reserve_multi_model_message_ids(
@@ -990,8 +986,8 @@ def build_chat_turn(
         )
     processing_run_id = user_message.id if is_multi else reserved_messages[0].id
 
-    # Convert the chat history into a simple format that is free of any DB objects
-    # and is easy to parse for the agent loop.
+    # ── 历史扁平化与无痕上下文恢复 ─────────────────────────────────────
+    # 将聊天历史转换为不含数据库对象的简单格式，便于 agent 循环解析。
     has_file_reader_tool = any(
         tool.in_code_tool_id == FILE_READER_TOOL_ID for tool in persona.tools
     )
@@ -1006,9 +1002,9 @@ def build_chat_turn(
     )
     simple_chat_history = chat_history_result.simple_messages
 
-    # Incognito rows are content-free, so earlier turns come from the store and
-    # the current message's text is restored onto convert_chat_history()'s
-    # blank-row shape. Regeneration uses the store as-is, it already holds the turn.
+    # 无痕记录行不保存内容，因此早期轮次从临时存储中读取。
+    # 当前消息文本会补回 convert_chat_history() 产生的空白行。
+    # 重新生成时直接使用存储中的内容，因为其中已包含该轮次。
     incognito_mode = chat_session.incognito_record_mode
     if not record_mode_persists_content(incognito_mode):
         stored_messages = load_incognito_context(chat_session.id).messages
@@ -1026,18 +1022,15 @@ def build_chat_turn(
         else:
             simple_chat_history = stored_messages
 
-    # Metadata for every text file injected into the history. After context-window
-    # truncation drops older messages, the LLM loop compares surviving file_id tags
-    # against this map to discover "forgotten" files and provide their metadata to
-    # FileReaderTool.
+    # 记录注入历史的每个文本文件元数据。
+    # 上下文窗口截断旧消息后，LLM 循环会用保留下来的 file_id 标签对比此映射。
+    # 这样可以发现“被遗忘”的文件，并把元数据提供给 FileReaderTool。
     all_injected_file_metadata: dict[str, FileToolMetadata] = (
         chat_history_result.all_injected_file_metadata if has_file_reader_tool else {}
     )
 
-    # Merge in file metadata from messages dropped by summary truncation. These files
-    # are no longer in simple_chat_history so they'd be invisible to the forgotten-file
-    # mechanism — they'll always appear as "forgotten" since no surviving message carries
-    # their file_id tag.
+    # 合并被摘要截断丢弃的消息中的文件元数据。
+    # 这些文件不再存在于 simple_chat_history 中，因此会被遗忘文件机制视为“被遗忘”。
     if summarized_file_metadata:
         for fid, meta in summarized_file_metadata.items():
             all_injected_file_metadata.setdefault(fid, meta)
@@ -1056,12 +1049,12 @@ def build_chat_turn(
         )
         simple_chat_history.insert(0, summary_simple)
 
-    # ── Stop signal and processing status ────────────────────────────────────
+    # ── 停止信号和处理状态 ─────────────────────────────────────────────────
     cache = get_cache_backend()
     reset_cancel_status(chat_session.id, cache)
 
-    # Bind the id, not the row: this closure is stored on ChatTurnSetup and
-    # would otherwise keep a detached ChatSession reachable for the whole turn.
+    # 只绑定 ID，不绑定数据库行对象。
+    # 该闭包会保存在 ChatTurnSetup 中，否则会让已分离的 ChatSession 在整轮处理中一直可达。
     chat_session_id = chat_session.id
 
     def check_is_connected() -> bool:
@@ -1074,9 +1067,8 @@ def build_chat_turn(
         run_id=processing_run_id,
     )
 
-    # Release any read transaction before the long-running LLM stream.
-    # If commit fails here, reset the processing status before propagating —
-    # otherwise the chat session appears stuck at "processing" permanently.
+    # 在长时间运行的 LLM 流开始前释放读事务。
+    # 如果这里提交失败，先重置处理状态再继续抛错，避免会话永久停留在 processing。
     try:
         db_session.commit()
     except Exception:
@@ -1660,37 +1652,33 @@ def _stream_chat_turn(
     slack_context: SlackContext | None = None,
     external_state_container: ChatStateContainer | None = None,
 ) -> AnswerStream:
-    """Private implementation for single-model and multi-model chat turn streaming.
+    """单模型和多模型聊天轮次流式处理的内部实现。
 
-    Builds the turn context via ``build_chat_turn`` inside a short-lived DB session,
-    then streams packets from ``_run_models`` back to the caller without holding any
-    DB connection. Handles setup errors, LLM errors, and cancellation uniformly,
-    saving whatever partial state has been accumulated before re-raising or yielding
-    a terminal error packet.
+    函数会在短生命周期数据库会话中通过 ``build_chat_turn`` 构建轮次上下文，
+    然后在不持有数据库连接的情况下，把 ``_run_models`` 产生的数据包流式返回。
+    初始化错误、LLM 错误和取消都会走统一处理流程，并尽量保存已累计的部分状态。
 
-    Not called directly — use the public wrappers:
-    - ``handle_stream_message_objects`` for single-model (N=1) requests.
-    - ``handle_multi_model_stream`` for side-by-side multi-model comparison (N>1).
+    不应直接调用此函数，请使用公开包装函数：
+    - 单模型请求（N=1）：``handle_stream_message_objects``。
+    - 多模型并排对比（N>1）：``handle_multi_model_stream``。
 
-    Args:
-        new_msg_req: The incoming chat request from the user.
-        user: Authenticated user; may be anonymous for public personas.
-        llm_overrides: ``None`` → single-model (persona default LLM).
-            Non-empty list → multi-model (one LLM per override, 2–3 items).
-        litellm_additional_headers: Extra headers forwarded to the LLM provider.
-        custom_tool_additional_headers: Extra headers for custom tool HTTP calls.
-        mcp_headers: Extra headers for MCP tool calls.
-        additional_context: Extra context prepended to the LLM's chat history, not
-            stored in the DB (used for Slack thread hydration).
-        slack_context: Federated Slack search context passed through to the search tool.
-        external_state_container: Optional pre-constructed state container. When
-            provided, accumulated state (tool calls, citations, answer tokens) is
-            written into it so the caller can inspect the result after streaming.
+    参数：
+        new_msg_req：用户发来的聊天请求。
+        user：已认证用户；公开 persona 场景下可以是匿名用户。
+        llm_overrides：``None`` 表示单模型，使用 persona 默认 LLM。
+            非空列表表示多模型，每个覆盖项对应一个 LLM，通常为 2 到 3 项。
+        litellm_additional_headers：透传给 LLM provider 的额外请求头。
+        custom_tool_additional_headers：透传给自定义工具 HTTP 调用的额外请求头。
+        mcp_headers：透传给 MCP 工具调用的额外请求头。
+        additional_context：追加到 LLM 聊天历史前的额外上下文，不写入数据库。
+        slack_context：传给搜索工具的 Slack 联邦搜索上下文。
+        external_state_container：可选的外部状态容器，用于让调用方在流结束后查看结果。
 
-    Returns:
-        Generator yielding ``Packet`` objects — answer tokens, tool output, citations —
-        followed by a terminal ``Packet`` containing ``OverallStop``.
+    返回：
+        逐个产出 ``Packet`` 对象，包括回答 token、工具输出和引用信息；
+        最后产出包含 ``OverallStop`` 的终止数据包。
     """
+    # mock_llm_response 只允许测试使用，避免生产环境绕过真实 LLM 调用。
     if new_msg_req.mock_llm_response is not None and not INTEGRATION_TESTS_MODE:
         raise ValueError(
             "mock_llm_response can only be used when INTEGRATION_TESTS_MODE=true"
@@ -1703,6 +1691,7 @@ def _stream_chat_turn(
     run_started = False
 
     try:
+        # 初始化阶段需要数据库会话；真正运行模型前会释放该会话。
         with get_session_with_current_tenant() as setup_db_session:
             try:
                 if (
@@ -1710,10 +1699,8 @@ def _stream_chat_turn(
                     and new_msg_req.internal_search_filters is not None
                     and new_msg_req.internal_search_filters.document_set is not None
                 ):
-                    # TODO @wenxi-onyx: this check for doc set access has been added
-                    # to SearchTool.run() so that all invocations of the SearchTool
-                    # will check for access before running. This instance should be removed
-                    # in a follow up PR.
+                    # TODO @wenxi-onyx：SearchTool.run() 已加入文档集权限检查，
+                    # 后续 PR 应移除这里的重复检查。
                     accessible_names = filter_document_set_names_by_user_access(
                         db_session=setup_db_session,
                         document_set_names=new_msg_req.internal_search_filters.document_set,
@@ -1731,8 +1718,8 @@ def _stream_chat_turn(
                             % unauthorized,
                         )
 
-                # Capture setup-phase packets (session/message IDs) so they can
-                # be replayed to a resuming client alongside the run's stream.
+                # 捕获初始化阶段的数据包，例如会话 ID 和消息 ID。
+                # 客户端恢复连接时，可以把这些数据包和运行阶段的数据流一起重放。
                 build_gen = build_chat_turn(
                     new_msg_req=new_msg_req,
                     user=user,
@@ -1754,18 +1741,19 @@ def _stream_chat_turn(
                     yield pre_run_packet
                 setup_db_session.expunge_all()
             except Exception:
+                # 初始化失败时回滚会话，避免留下未提交的部分状态。
                 setup_db_session.rollback()
                 raise
 
+        # 测试模式下把 mock 响应放入上下文变量，供底层 LLM 调用读取。
         if new_msg_req.mock_llm_response is not None:
             mock_response_token = set_llm_mock_response(new_msg_req.mock_llm_response)
 
         assert setup is not None, (
             "build_chat_turn must complete before _run_models is called"
         )
-        # Read at trace start, by the memory gate, and by interaction logging.
-        # Cleared with a plain set: a Token reset raises when this generator's
-        # frames resume under a different context.
+        # 无痕记录模式会被 trace、memory gate 和交互日志读取。
+        # 这里用普通 set 清理；生成器在不同上下文恢复时，Token reset 会报错。
         if setup.incognito_record_mode is not None:
             CURRENT_INCOGNITO_RECORD_MODE_CONTEXTVAR.set(
                 setup.incognito_record_mode.value
@@ -1773,8 +1761,8 @@ def _stream_chat_turn(
             incognito_mode_flag_set = True
         content_free = not record_mode_persists_content(setup.incognito_record_mode)
         if content_free:
-            # Set for the whole turn so a blob any tool saves carries the
-            # session on its record, which is what teardown deletes by.
+            # 整个轮次都设置 content-free 会话 ID。
+            # 工具保存 blob 时会带上该会话 ID，便于会话结束时清理。
             CURRENT_CONTENT_FREE_SESSION_ID_CONTEXTVAR.set(str(setup.chat_session_id))
         stream_buffer = StreamBufferWriter(
             cache=setup.cache,
@@ -1789,8 +1777,7 @@ def _stream_chat_turn(
         )
         for pre_run_packet in pre_run_packets:
             stream_buffer.append_line(get_json_line(pre_run_packet.model_dump()))
-        # _run_models starts the writer thread before returning; from that point
-        # the writer owns the fence reset.
+        # _run_models 返回前会启动写入线程；此后由写入线程负责重置 fence。
         run_stream = _run_models(
             setup=setup,
             user=user,
@@ -1801,6 +1788,7 @@ def _stream_chat_turn(
         yield from run_stream
 
     except OnyxError as e:
+        # 业务异常直接转换为流式错误包返回给客户端。
         if e.error_code is not OnyxErrorCode.QUERY_REJECTED:
             log_onyx_error(e)
         yield StreamingError(
@@ -1811,6 +1799,7 @@ def _stream_chat_turn(
         return
 
     except ValueError as e:
+        # 输入或配置校验失败时，按可重试的校验错误返回。
         logger.exception("Failed to process chat message.")
         yield StreamingError(
             error=str(e),
@@ -1820,6 +1809,7 @@ def _stream_chat_turn(
         return
 
     except EmptyLLMResponseError as e:
+        # LLM 返回空内容时保留 provider 和模型信息，便于前端展示和排查。
         stack_trace = traceback.format_exc()
         logger.warning(
             "LLM returned an empty response "
@@ -1843,6 +1833,7 @@ def _stream_chat_turn(
         )
 
     except Exception as e:
+        # 未知异常会先脱敏，再按当前 LLM 的 provider 错误语义返回。
         logger.exception("Failed to process chat message due to %s", e)
         stack_trace = traceback.format_exc()
 
@@ -1872,14 +1863,15 @@ def _stream_chat_turn(
             )
 
     finally:
+        # 清理本轮调用设置的 mock 响应和无痕上下文变量。
         if mock_response_token is not None:
             reset_llm_mock_response(mock_response_token)
         if incognito_mode_flag_set:
             CURRENT_INCOGNITO_RECORD_MODE_CONTEXTVAR.set(None)
             CURRENT_CONTENT_FREE_SESSION_ID_CONTEXTVAR.set(None)
         try:
-            # Once _run_models started, its writer thread owns the fence — the
-            # run may still be in flight after this generator is closed.
+            # _run_models 启动后由写入线程负责 fence。
+            # 生成器关闭时，运行阶段可能仍未完全结束。
             if setup is not None and not run_started:
                 set_processing_status(
                     chat_session_id=setup.chat_session_id,
@@ -1901,12 +1893,12 @@ def handle_stream_message_objects(
     slack_context: SlackContext | None = None,
     external_state_container: ChatStateContainer | None = None,
 ) -> AnswerStream:
-    """Single-model streaming entrypoint. For multi-model comparison, use ``handle_multi_model_stream``.
+    """单模型流式处理入口。多模型对比请使用 ``handle_multi_model_stream``。
 
-    Emits a ``latency`` telemetry record for the whole turn once the stream is
-    exhausted or closed. Callers must pass ``user`` as a keyword argument so the
-    record carries the user id.
+    当流被消费完或关闭时，会为整个对话轮次发送 ``latency`` 遥测记录。
+    调用方必须以关键字参数传入 ``user``，确保记录中包含用户 ID。
     """
+    # 单模型路径复用统一的聊天轮次流式处理逻辑，不传入模型覆盖列表。
     yield from _stream_chat_turn(
         new_msg_req=new_msg_req,
         user=user,
