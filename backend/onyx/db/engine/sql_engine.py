@@ -440,7 +440,7 @@ def get_readonly_sqlalchemy_engine() -> Engine:
 
 @contextmanager
 def get_session_with_current_tenant() -> Generator[Session, None, None]:
-    """Standard way to get a DB session."""
+    """获取当前租户数据库会话的标准方式。"""
     tenant_id = get_current_tenant_id()
     with get_session_with_tenant(tenant_id=tenant_id) as session:
         yield session
@@ -517,18 +517,19 @@ def _safe_close_session(session: Session) -> None:
 @contextmanager
 def get_session_with_tenant(*, tenant_id: str) -> Generator[Session, None, None]:
     """
-    Generate a database session for a specific tenant.
+    为指定租户创建数据库会话。
 
-    The tenant selects both the schema (via `schema_translate_map`, below) and the
-    physical database (via the shard registry). With one shard configured the latter
-    resolves to the single default engine.
+    租户会同时决定 schema 和物理数据库。schema 通过下面的
+    schema_translate_map 选择，物理数据库通过分片注册表选择。
+    只有一个分片时，会使用默认数据库引擎。
     """
+    # 租户 ID 会进入 schema_translate_map，必须先校验为合法 schema 名称。
     if not is_valid_schema_name(tenant_id):
         raise HTTPException(status_code=400, detail="Invalid tenant ID")
 
     engine = get_engine_for_tenant(tenant_id)
 
-    # no need to use the schema translation map for self-hosted + default schema
+    # 自托管单租户默认 schema 不需要做 schema 映射。
     if not MULTI_TENANT and tenant_id == POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE:
         session = Session(bind=engine, expire_on_commit=False)
         try:
@@ -537,7 +538,7 @@ def get_session_with_tenant(*, tenant_id: str) -> Generator[Session, None, None]
             _safe_close_session(session)
         return
 
-    # Create connection with schema translation to handle querying the right schema
+    # 创建带 schema 映射的连接，确保查询落到指定租户的 schema。
     schema_translate_map = {None: tenant_id}
     with engine.connect().execution_options(
         schema_translate_map=schema_translate_map

@@ -890,22 +890,27 @@ def handle_send_chat_message(
     if not chat_message_req.stream:
         # 启用用量限制时，先检查本次调用是否超额，再计数并提交。
         if is_usage_limits_enabled():
+            # 打开当前租户的数据库会话，确保用量读写落到正确租户。
             with get_session_with_current_tenant() as usage_db_session:
+                # 先把本次非流式调用作为待消耗量检查，超额时直接抛错。
                 check_usage_and_raise(
                     db_session=usage_db_session,
                     usage_type=UsageType.NON_STREAMING_API_CALLS,
                     tenant_id=tenant_id,
                     pending_amount=1,
                 )
+                # 检查通过后再记录实际消耗，避免失败请求占用额度。
                 increment_usage(
                     db_session=usage_db_session,
                     usage_type=UsageType.NON_STREAMING_API_CALLS,
                     amount=1,
                 )
+                # 显式提交本次额度消耗，确保后续请求能看到最新计数。
                 usage_db_session.commit()
 
         # 状态容器在消息处理和结果汇总之间共享会话状态。
         state_container = ChatStateContainer()
+        # 非流式响应仍复用流式消息处理流程，先生成内部事件序列。
         packets = handle_stream_message_objects(
             new_msg_req=chat_message_req,
             user=user,
@@ -919,6 +924,7 @@ def handle_send_chat_message(
             additional_context=chat_message_req.additional_context,
             external_state_container=state_container,
         )
+        # 将事件序列和共享状态汇总成完整响应对象，一次性返回给客户端。
         result = gather_stream_full(packets, state_container)
         # 仅新建会话会产生 CreateChatSessionID 事件。
         # 现有会话的后续消息需从请求补入会话 ID，避免汇总结果缺少该字段。
@@ -931,8 +937,10 @@ def handle_send_chat_message(
 
     # 单模型流式分支：Onyx 界面通常使用此路径，逐个返回事件。
     def stream_generator() -> Generator[str, None, None]:
+        # 状态容器保存本次流式处理期间产生的会话状态。
         state_container = ChatStateContainer()
         try:
+            # 复用标准消息处理流程，按事件逐个产出给前端。
             for obj in handle_stream_message_objects(
                 new_msg_req=chat_message_req,
                 user=user,
@@ -955,6 +963,7 @@ def handle_send_chat_message(
             yield json.dumps({"error": str(e)})
 
         finally:
+            # 无论正常结束还是异常退出，都记录流式生成器已收尾。
             logger.debug("Stream generator finished")
 
     return StreamingResponse(stream_generator(), media_type="text/event-stream")

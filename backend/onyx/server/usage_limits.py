@@ -51,7 +51,7 @@ def is_onyx_managed_api_key(api_key: str | None) -> bool:
 
 
 def is_usage_limits_enabled() -> bool:
-    """Check if usage limits are enabled for this deployment."""
+    """检查当前部署是否启用了用量限制。"""
     return USAGE_LIMITS_ENABLED
 
 
