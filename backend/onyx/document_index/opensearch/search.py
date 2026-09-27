@@ -344,48 +344,74 @@ class DocumentQuery:
         index_filters: IndexFilters,
         include_hidden: bool,
     ) -> dict[str, Any]:
-        """Returns a final hybrid search query.
+        """组装完整的 OpenSearch 混合检索请求体，结合向量检索与关键词检索。
 
-        NOTE: This query can be directly supplied to the OpenSearch client, but
-        it MUST be supplied in addition to a search pipeline. The results from
-        hybrid search are not meaningful without that step.
+        调用链路（使用 OpenSearch 索引时）：
+            search_chunks → _embed_and_hybrid_search
+            → OpenSearchDocumentIndex.hybrid_retrieval → 本方法。
 
-        TODO(andrei): There is some duplicated logic in this function with
-        others in this file.
+        上游生成查询向量后，本方法调用 _get_hybrid_search_subqueries 构建各路
+        子查询，调用 _get_search_filters 构建租户、权限和业务范围过滤条件，
+        再组装候选深度、返回数量、超时及可选的高亮和评分解释配置。
 
-        Args:
-            query_text: The text to query for.
-            query_vector: The vector embedding of the text to query for.
-            num_hits: The final number of hits to return.
-            tenant_state: Tenant state containing the tenant ID.
-            index_filters: Filters for the hybrid search query.
-            include_hidden: Whether to include hidden documents.
+        本方法只返回请求体，不执行搜索。hybrid_retrieval 将返回值作为 body，
+        同时传入归一化管道名称，调用客户端 search。搜索管道负责各路分数的
+        归一化与加权合并，不能仅依靠此请求体完成混合评分。
 
-        Returns:
-            A dictionary representing the final hybrid search query.
+        TODO(andrei)：本方法与文件中的其他方法存在部分重复逻辑。
+
+        参数：
+            query_text：用于关键词匹配的查询文本。
+            query_vector：上游已生成的查询向量，用于语义匹配。
+            num_hits：最终最多返回的命中数量，不是每路检索的候选数量。
+            tenant_state：包含租户 ID 的租户状态。
+            index_filters：权限、来源、标签、文档集等检索过滤条件。
+            include_hidden：是否允许检索隐藏文档。
+
+        返回：
+            可传给 OpenSearch 客户端的请求体字典，执行时需同时指定搜索管道。
         """
-        # WARNING: Profiling does not work with hybrid search; do not add it at
-        # this level. See https://github.com/opensearch-project/neural-search/issues/1255
+        # 注意：此处保留混合检索不启用 profile 的兼容性约束，相关问题见：
+        # https://github.com/opensearch-project/neural-search/issues/1255
 
+        # 提前拦截超出当前结果窗口上限的请求。
         if num_hits > DEFAULT_OPENSEARCH_MAX_RESULT_WINDOW:
             raise ValueError(
                 f"Bug: num_hits ({num_hits}) is greater than the current maximum allowed "
                 f"result window ({DEFAULT_OPENSEARCH_MAX_RESULT_WINDOW})."
             )
 
-        # TODO(andrei, yuhong): We can tune this more dynamically based on
-        # num_hits.
+        # 各路先保留候选池，再由混合评分选出最多 num_hits 个结果。
+        # TODO(andrei, yuhong)：后续可根据 num_hits 动态调整候选数量。
         max_results_per_subquery = DEFAULT_NUM_HYBRID_SUBQUERY_CANDIDATES
 
+        # 按配置构建两路或三路子查询，顺序必须与搜索管道的权重一致。
         hybrid_search_subqueries = DocumentQuery._get_hybrid_search_subqueries(
             query_text, query_vector, vector_candidates=max_results_per_subquery
         )
+        # 统一构建过滤条件，让各路召回遵守相同的租户、权限和业务范围限制。
+        # tenant_state：多租户模式下，仅检索当前租户的文档。
+        # include_hidden：为 False 时排除隐藏文档，为 True 时不添加隐藏状态限制。
+        # access_control_list：允许公开文档或命中任一 ACL 的文档；None 不限制，空列表仅允许公开文档。
+        # source_types：文档来源类型，匹配列表中的任一种；空列表不限制。
+        # tags：文档元数据标签，匹配任一键值对；空列表不限制。
+        # document_sets：知识范围中允许的文档集，匹配任一文档集名称。
+        # project_id_filter：知识范围中允许的项目，匹配归属于该项目的文件。
+        # persona_id_filter：知识范围中允许的助手，匹配关联该助手的文件。
+        # created_at_range：创建时间的闭区间；同时保留缺少创建时间的文档。
+        # updated_at_range：更新时间的闭区间；缺少时间的文档通常排除，
+        # 仅当下限早于配置的假定文档年龄阈值、且无上限时保留。
+        # min_chunk_index / max_chunk_index：片段序号的包含式下限和上限；此处均不限制。
+        # attached_document_ids：知识范围中显式指定的文档 ID，匹配任一 ID。
+        # hierarchy_node_ids：知识范围中的目录或空间节点，匹配祖先节点包含任一指定 ID 的片段。
+        # forced_document_sets：强制限定的文档集名称，作为独立条件进一步收窄结果。
+        # 知识范围的五项条件（文档集、项目、助手、文档 ID、层级节点）按 OR 合并，
+        # 未指定任何一项时不限制知识范围；该组合与其他过滤条件按 AND 合并。
         hybrid_search_filters = DocumentQuery._get_search_filters(
             tenant_state=tenant_state,
             include_hidden=include_hidden,
-            # TODO(andrei): We've done no filtering for PUBLIC_DOC_PAT up to
-            # now. This should not cause any issues but it can introduce
-            # redundant filters in queries that may affect performance.
+            # TODO(andrei)：尚未对 PUBLIC_DOC_PAT 做特殊过滤处理；可能产生冗余
+            # 过滤条件，虽不应影响正确性，但可能影响查询性能。
             access_control_list=index_filters.access_control_list,
             source_types=index_filters.source_type or [],
             tags=index_filters.tags or [],
@@ -401,46 +427,44 @@ class DocumentQuery:
             forced_document_sets=index_filters.forced_document_set,
         )
 
-        # See https://docs.opensearch.org/latest/query-dsl/compound/hybrid/
+        # 将子查询和公共过滤条件组装为 hybrid 查询，结构参考：
+        # https://docs.opensearch.org/latest/query-dsl/compound/hybrid/
         hybrid_search_query: dict[str, Any] = {
             "hybrid": {
                 "queries": hybrid_search_subqueries,
-                # Max results per subquery per shard before aggregation. Ensures
-                # keyword and vector subqueries contribute equally to the
-                # candidate pool for hybrid fusion.
-                # Sources:
+                # 每个分片上，每路子查询在聚合前保留的最大结果数。
+                # 为关键词和向量查询设置相同候选上限，并不保证实际命中数相同。
+                # 参考：
                 # https://docs.opensearch.org/latest/vector-search/ai-search/hybrid-search/pagination/
                 # https://opensearch.org/blog/navigating-pagination-in-hybrid-queries-with-the-pagination_depth-parameter/
                 "pagination_depth": max_results_per_subquery,
-                # Applied to all the sub-queries independently (this avoids
-                # subqueries having a lot of results thrown out during
-                # aggregation).
-                # Sources:
+                # 公共过滤条件分别作用于各路子查询，避免到聚合阶段才大量丢弃结果。
+                # 参考：
                 # https://docs.opensearch.org/latest/query-dsl/compound/hybrid/
                 # https://opensearch.org/blog/introducing-common-filter-support-for-hybrid-search-queries
-                # Does AND for each filter in the list.
+                # 列表中的过滤条件按 AND 组合，必须全部满足。
                 "filter": {"bool": {"filter": hybrid_search_filters}},
             }
         }
 
+        # 补齐请求级配置：最终返回上限、查询超时和响应字段。
         final_hybrid_search_body: dict[str, Any] = {
             "query": hybrid_search_query,
             "size": num_hits,
             "timeout": f"{DEFAULT_OPENSEARCH_QUERY_TIMEOUT_S}s",
-            # Exclude retrieving the vector fields in order to save on
-            # retrieval cost as we don't need them upstream.
+            # 向量仍用于检索，但不随结果返回，减少上游不需要的数据传输。
             "_source": {
                 "excludes": [TITLE_VECTOR_FIELD_NAME, CONTENT_VECTOR_FIELD_NAME]
             },
         }
 
+        # 按配置返回匹配片段的高亮信息，供上游展示命中内容。
         if not OPENSEARCH_MATCH_HIGHLIGHTS_DISABLED:
             final_hybrid_search_body["highlight"] = (
                 DocumentQuery._get_match_highlights_configuration()
             )
 
-        # Explain is for scoring breakdowns. Setting this significantly
-        # increases query latency.
+        # 评分解释用于排查得分来源；启用后会显著增加查询延迟。
         if OPENSEARCH_EXPLAIN_ENABLED:
             final_hybrid_search_body["explain"] = True
 
@@ -678,72 +702,70 @@ class DocumentQuery:
     def _get_hybrid_search_subqueries(
         query_text: str,
         query_vector: list[float],
-        # The default number of neighbors to consider for knn vector similarity
-        # search. This is higher than the number of results because the scoring
-        # is hybrid. For a detailed breakdown, see where the default value is
-        # set.
+        # 向量近邻搜索的候选数量；为混合评分保留较大的候选池。
+        # 这不是最终返回数量，默认值的依据见常量定义。
         vector_candidates: int = DEFAULT_NUM_HYBRID_SUBQUERY_CANDIDATES,
     ) -> list[dict[str, Any]]:
-        """Returns subqueries for hybrid search.
+        """按配置构建混合检索的子查询，将向量语义匹配与关键词匹配组合起来。
 
-        Each of these subqueries are the "hybrid" component of this search. We
-        search on various things and combine results.
+        调用链路（使用 OpenSearch 索引时）：
+            search_chunks → _embed_and_hybrid_search
+            → OpenSearchDocumentIndex.hybrid_retrieval
+            → DocumentQuery.get_hybrid_search_query → 本方法。
 
-        The return of this function is not sufficient to be directly supplied to
-        the OpenSearch client. See get_hybrid_search_query.
+        上游先生成查询向量，再传入查询文本和向量。本方法只构建查询字典，
+        不生成向量，也不发送搜索请求。HYBRID_SEARCH_SUBQUERY_CONFIGURATION
+        决定使用“标题向量 + 正文向量 + 标题正文关键词”三路检索，
+        或“正文向量 + 标题正文关键词”两路检索。
 
-        Normalization is not performed here.
-        The weights of each of these subqueries should be configured in a search
-        pipeline.
+        返回值只是子查询列表，不能直接作为完整请求发送给 OpenSearch。
+        get_hybrid_search_query 将其放入 hybrid.queries，并补充过滤条件和
+        返回数量等配置。hybrid_retrieval 随后调用客户端 search，传入完整查询
+        和归一化管道名称，由搜索管道执行分数归一化与加权合并。
+        子查询顺序必须与管道中的权重顺序一致。
 
-        The exact subqueries executed depend on the
-        HYBRID_SEARCH_SUBQUERY_CONFIGURATION setting.
-
-        NOTE: For OpenSearch, 5 is the maximum number of query clauses allowed
-        in a single hybrid query. Source:
+        注意：单个 OpenSearch hybrid 查询最多允许 5 个子查询。参考：
         https://docs.opensearch.org/latest/query-dsl/compound/hybrid/
 
-        NOTE: Each query is independent during the search phase; there is no
-        backfilling of scores for missing query components. What this means is
-        that if a document was a good vector match but did not show up for
-        keyword, it gets a score of 0 for the keyword component of the hybrid
-        scoring. This is not as bad as just disregarding a score though as there
-        is normalization applied after. So really it is "increasing" the missing
-        score compared to if it was included and the range was renormalized.
-        This does however mean that between docs that have high scores for say
-        the vector field, the keyword scores between them are completely ignored
-        unless they also showed up in the keyword query as a reasonably high
-        match. TLDR, this is a bit of unique funky behavior but it seems ok.
+        各路查询独立召回，不会为未进入某路候选集的文档补算该路分数。
+        例如，文档仅被向量查询召回时，关键词分量按 0 处理；最终分数还取决于
+        后续归一化与合并。因此，向量命中文档之间的关键词差异，只有在它们也
+        进入关键词候选集时才会参与评分。
 
-        NOTE: Options considered and rejected:
-        - minimum_should_match: Since it's hybrid search and users often provide
-          semantic queries, there is often a lot of terms, and very low number
-          of meaningful keywords (and a low ratio of keywords).
-        - fuzziness AUTO: Typo tolerance (0/1/2 edit distance by term length).
-          It's mostly for typos as the analyzer ("english" by default) already
-          does some stemming and tokenization. In testing datasets, this makes
-          recall slightly worse. It also is less performant so not really any
-          reason to do it.
+        已考虑但未采用的选项：
+        - minimum_should_match：自然语言查询通常词语较多，有效关键词占比较低，
+          设置最低匹配数量可能排除相关结果。
+        - fuzziness AUTO：按词长允许 0/1/2 次编辑距离，主要用于拼写容错。
+          分析器（默认 english）已有分词和词干处理；原有测试中该选项略微降低
+          召回效果，并增加查询开销，因此未启用。
 
-        Args:
-            query_text: The text of the query to search for.
-            query_vector: The vector embedding of the query to search for.
-            num_candidates: The number of candidates to consider for vector
-                similarity search.
+        参数：
+            query_text：用于标题和正文关键词匹配的查询文本。
+            query_vector：已生成的查询向量，用于向量相似度检索。
+            vector_candidates：每路向量查询的近邻候选数量（knn.k）。
+
+        返回：
+            按搜索管道权重顺序排列的子查询字典列表。
         """
-        # Build sub-queries for hybrid search. Order must match normalization
-        # pipeline weights.
+        # 按配置选择召回通道；调整列表顺序时必须同步调整归一化管道的权重。
         if (
             HYBRID_SEARCH_SUBQUERY_CONFIGURATION
             is HybridSearchSubqueryConfiguration.TITLE_VECTOR_CONTENT_VECTOR_TITLE_CONTENT_COMBINED_KEYWORD
         ):
+            # 三路召回：标题语义、正文语义，以及标题与正文的关键词匹配。
             return [
+                # 标题向量召回：比较查询向量与标题向量，查找主题语义相近的内容。
+                # 不要求出现相同词语，使用 vector_candidates 作为近邻候选数量。
                 DocumentQuery._get_title_vector_similarity_search_query(
                     query_vector, vector_candidates
                 ),
+                # 正文向量召回：比较查询向量与正文块向量，查找具体内容语义相近的片段。
+                # 补充标题未体现的细节，同样使用 vector_candidates 作为候选数量。
                 DocumentQuery._get_content_vector_similarity_search_query(
                     query_vector, vector_candidates
                 ),
+                # 关键词召回：对查询文本分词，在标题和正文中进行词项与短语匹配。
+                # 补充向量检索对具体名称、术语的匹配；正文权重较高，标题提供少量加分。
                 DocumentQuery._get_title_content_combined_keyword_search_query(
                     query_text
                 ),
@@ -752,6 +774,7 @@ class DocumentQuery:
             HYBRID_SEARCH_SUBQUERY_CONFIGURATION
             is HybridSearchSubqueryConfiguration.CONTENT_VECTOR_TITLE_CONTENT_COMBINED_KEYWORD
         ):
+            # 两路召回：保留正文语义和关键词匹配，不单独查询标题向量。
             return [
                 DocumentQuery._get_content_vector_similarity_search_query(
                     query_vector, vector_candidates
@@ -761,6 +784,7 @@ class DocumentQuery:
                 ),
             ]
         else:
+            # 新增配置必须显式定义子查询组合，避免使用错误的召回通道或权重。
             raise ValueError(
                 f"Bug: Unhandled hybrid search subquery configuration: {HYBRID_SEARCH_SUBQUERY_CONFIGURATION}"
             )
@@ -770,10 +794,17 @@ class DocumentQuery:
         query_vector: list[float],
         vector_candidates: int = DEFAULT_NUM_HYBRID_SUBQUERY_CANDIDATES,
     ) -> dict[str, Any]:
+        """构建标题向量近邻查询，召回与查询语义相近的标题。
+
+        query_vector 是上游生成的查询向量；vector_candidates 控制近邻候选数。
+        返回查询字典，由调用方组装并执行搜索。
+        """
         return {
             "knn": {
+                # 在标题向量字段上比较相似度，而非直接匹配标题文本。
                 TITLE_VECTOR_FIELD_NAME: {
                     "vector": query_vector,
+                    # 向量查询的候选数，不是混合检索最终返回的结果数。
                     "k": vector_candidates,
                 }
             }
@@ -785,8 +816,15 @@ class DocumentQuery:
         vector_candidates: int = DEFAULT_NUM_HYBRID_SUBQUERY_CANDIDATES,
         search_filters: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        """构建正文块向量近邻查询，可附加不参与评分的过滤条件。
+
+        query_vector 用于匹配正文语义，vector_candidates 控制近邻候选数。
+        search_filters 由调用方提供，用于限制可召回的内容范围。
+        本方法只返回查询字典，不执行搜索。
+        """
         query = {
             "knn": {
+                # 检索正文块的向量，补充标题未体现的具体内容。
                 CONTENT_VECTOR_FIELD_NAME: {
                     "vector": query_vector,
                     "k": vector_candidates,
@@ -795,6 +833,7 @@ class DocumentQuery:
         }
 
         if search_filters is not None:
+            # 将过滤条件放入 knn 查询；候选内容必须同时满足所有过滤条件。
             query["knn"][CONTENT_VECTOR_FIELD_NAME]["filter"] = {
                 "bool": {"filter": search_filters}
             }  # ty: ignore[invalid-assignment]
@@ -806,34 +845,40 @@ class DocumentQuery:
         query_text: str,
         search_filters: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        """构建标题与正文的关键词查询，结合词项匹配和短语匹配评分。
+
+        query_text 经分析器处理后用于文本匹配；正文为主，标题提供少量加分。
+        search_filters 限制匹配范围，不参与相关性评分。
+        返回值是一路关键词子查询，其中包含四个可累加评分的 should 子句。
+        """
         query = {
             "bool": {
+                # 命中任一子句即可参与召回，同时命中多个子句时累计其得分。
                 "should": [
                     {
                         "match": {
                             TITLE_FIELD_NAME: {
                                 "query": query_text,
+                                # 查询分词后，匹配其中任一词项即可。
                                 "operator": "or",
-                                # The title fields are strongly discounted as
-                                # they are included in the content. This just
-                                # acts as a minor boost.
+                                # 正文已包含标题内容，降低标题权重以减少重复加分。
                                 "boost": 0.1,
                             }
                         }
                     },
                     {
+                        # 标题短语匹配比零散词项匹配获得更高权重。
                         "match_phrase": {
                             TITLE_FIELD_NAME: {
                                 "query": query_text,
+                                # 允许一个词项位置的偏移，保留少量短语匹配容差。
                                 "slop": 1,
                                 "boost": 0.2,
                             }
                         }
                     },
                     {
-                        # Analyzes the query and returns results which match any
-                        # of the query's terms. More matches result in higher
-                        # scores.
+                        # 正文匹配任一查询词项即可；匹配更多词项通常能提高得分。
                         "match": {
                             CONTENT_FIELD_NAME: {
                                 "query": query_text,
@@ -843,26 +888,25 @@ class DocumentQuery:
                         }
                     },
                     {
-                        # Matches an exact phrase in a specified order.
+                        # 正文短语匹配额外加分，优先考虑词项位置接近查询短语的内容。
                         "match_phrase": {
                             CONTENT_FIELD_NAME: {
                                 "query": query_text,
-                                # The number of words permitted between words of
-                                # a query phrase and still result in a match.
+                                # 允许一个词项位置的偏移，并非要求完全连续的精确短语。
                                 "slop": 1,
                                 "boost": 1.5,
                             }
                         }
                     },
                 ],
-                # Ensures at least one match subquery from the query is present
-                # in the document. This defaults to 1, unless a filter or must
-                # clause is supplied, in which case it defaults to 0.
+                # 显式要求至少命中一个 should 子句，避免添加 filter 后默认变为 0，
+                # 导致仅满足过滤条件、却不匹配查询文本的内容也被召回。
                 "minimum_should_match": 1,
             }
         }
 
         if search_filters is not None:
+            # 所有过滤条件必须同时满足，且不改变关键词相关性评分。
             query["bool"]["filter"] = search_filters
 
         return query

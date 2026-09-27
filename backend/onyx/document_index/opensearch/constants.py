@@ -25,19 +25,13 @@ EF_CONSTRUCTION = 256
 # quality but increase memory footprint. Values typically range between 12 - 48.
 M = 32  # Set relatively high for better accuracy.
 
-# When performing hybrid search, we need to consider more candidates than the
-# number of results to be returned. This is because the scoring is hybrid and
-# the results are reordered due to the hybrid scoring. Higher = more candidates
-# for hybrid fusion = better retrieval accuracy, but results in more computation
-# per query. Imagine a simple case with a single keyword query and a single
-# vector query and we want 10 final docs. If we only fetch 10 candidates from
-# each of keyword and vector, they would have to have perfect overlap to get a
-# good hybrid ranking for the 10 results. If we fetch 1000 candidates from each,
-# we have a much higher chance of all 10 of the final desired docs showing up
-# and getting scored. In worse situations, the final 10 docs don't even show up
-# as the final 10 (worse than just a miss at the reranking step).
-# Defaults to 500 for now. Initially this defaulted to 750 but we were seeing
-# poor search performance; bumped from 100 to 500 to improve recall.
+# 混合检索会合并各路分数并重新排序，因此候选数量应多于最终返回数量。
+# 候选越多，越有机会召回相关内容并参与混合评分，但每次查询的计算开销也越大。
+# 例如，最终需要 10 个结果时，若关键词和向量查询各只取 10 个候选，
+# 候选重叠不足就可能缺少某一路的得分，甚至漏掉综合评分本应靠前的文档。
+# 若各取 1000 个候选，目标文档被召回并获得各路评分的机会更大。
+# 未进入候选集的文档无法通过后续重新排序找回。
+# 当前默认值为 500；最初设为 750 时查询性能不佳，后来从 100 提升至 500 以改善召回。
 DEFAULT_NUM_HYBRID_SUBQUERY_CANDIDATES = int(
     os.environ.get("DEFAULT_NUM_HYBRID_SUBQUERY_CANDIDATES", 500)
 )
@@ -82,9 +76,9 @@ class HybridSearchSubqueryConfiguration(Enum):
     CONTENT_VECTOR_TITLE_CONTENT_COMBINED_KEYWORD = 2
 
 
-# Will raise and block application start if HYBRID_SEARCH_SUBQUERY_CONFIGURATION
-# is set but not a valid value. If not set, defaults to
-# CONTENT_VECTOR_TITLE_CONTENT_COMBINED_KEYWORD.
+# 从环境变量读取混合检索组合，转换为整数并校验对应的枚举值。
+# 未设置时，默认使用“正文向量 + 标题正文关键词”两路检索。
+# 已设置但无法转为整数或不属于有效枚举值时，抛出异常并阻止应用启动。
 HYBRID_SEARCH_SUBQUERY_CONFIGURATION: HybridSearchSubqueryConfiguration = (
     HybridSearchSubqueryConfiguration(
         int(os.environ["HYBRID_SEARCH_SUBQUERY_CONFIGURATION"])
