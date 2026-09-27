@@ -1569,30 +1569,35 @@ class OpenSearchIndexClient(OpenSearchClient):
         search_pipeline_id: str | None,
         search_type: OpenSearchSearchType = OpenSearchSearchType.UNKNOWN,
     ) -> list[SearchHit[DocumentChunkWithoutVectors]]:
-        """Searches the index.
+        """执行索引搜索，并将原始响应校验、转换为类型明确的命中列表。
 
-        NOTE: Does not return vector fields. In order to take advantage of
-        performance benefits, the search body should exclude the schema's vector
-        fields.
+        混合检索调用链路：
+            search_chunks → _embed_and_hybrid_search
+            → OpenSearchDocumentIndex.hybrid_retrieval
+            → OpenSearchIndexClient.search（本方法）→ 底层客户端 search。
+        关键词检索和按文档 ID 检索等路径也会复用本方法。
 
-        TODO(andrei): Ideally we could check that every field in the body is
-        present in the index, to avoid a class of runtime bugs that could easily
-        be caught during development. Or change the function signature to accept
-        a predefined pydantic model of allowed fields.
+        调用方负责构建请求体并选择搜索管道。本方法发送请求，记录耗时和错误，
+        检查服务端超时，再将命中内容转换为 SearchHit。上游随后可继续转换为
+        InferenceChunk 并清理正文；本方法不执行这些业务处理。
 
-        Args:
-            body: The body of the search request. See the OpenSearch
-                documentation for more information on search request bodies.
-            search_pipeline_id: The ID of the search pipeline to use. If None,
-                the default search pipeline will be used.
-            search_type: Label for Prometheus metrics. Does not affect search
-                behavior.
+        返回的片段模型不包含向量字段。调用方还应在 body 的 _source 配置中
+        排除向量字段，才能减少实际传输的数据量。
 
-        Raises:
-            Exception: There was an error searching the index.
+        TODO(andrei)：校验请求体字段是否存在于索引中，或改用预定义的 Pydantic
+        模型限制允许的字段，以便在开发阶段发现字段错误。
 
-        Returns:
-            List of search hits that match the search request.
+        参数：
+            body：调用方构建的 OpenSearch 搜索请求体。
+            search_pipeline_id：搜索管道 ID；None 表示不显式指定，遵循索引默认配置。
+            search_type：Prometheus 指标分类标签，不影响搜索行为。
+
+        异常：
+            Exception：搜索请求、响应解析、超时检查或模型校验失败时向上传播。
+            RuntimeError：命中结果缺少有效的 _source 数据。
+
+        返回：
+            包含文档片段、得分、高亮及可选评分解释的搜索命中列表。
         """
         logger.debug(
             "Trying to search index %s with search pipeline %s.",
@@ -1600,10 +1605,13 @@ class OpenSearchIndexClient(OpenSearchClient):
             search_pipeline_id,
         )
         result: dict[str, Any]
+        # 请求服务端返回各搜索阶段的耗时，用于性能日志。
         params = {"phase_took": "true"}
+        # 启用指标时统计请求次数和正在执行的请求数，否则使用空上下文。
         ctx = self._get_emit_metrics_context_manager(search_type)
         with ctx:
             try:
+                # 计时范围是底层客户端调用，包含通信等待，不包含后续结果转换。
                 t0 = time.perf_counter()
                 result = self._client.search(
                     index=self._index_name,
@@ -1612,14 +1620,12 @@ class OpenSearchIndexClient(OpenSearchClient):
                     params=params,
                 )
                 client_duration_s = time.perf_counter() - t0
+                # 拆出命中列表、服务端耗时、超时标记、阶段耗时和性能分析数据。
                 hits, time_took, timed_out, phase_took, profile = (
                     self._get_hits_and_profile_from_search_result(result)
                 )
-                # Inside the try/except so that server-side timeouts (which
-                # raise inside this helper) land in
-                # record_opensearch_search_error and never reach
-                # observe_opensearch_search — keeping the latency histograms
-                # clean of timed-out queries.
+                # 在 try 内检查服务端超时：超时会抛异常并计入错误指标，
+                # 不会进入后续的成功查询耗时统计，避免污染延迟直方图。
                 self._log_search_result_perf(
                     time_took=time_took,
                     timed_out=timed_out,
@@ -1630,23 +1636,29 @@ class OpenSearchIndexClient(OpenSearchClient):
                     raise_on_timeout=True,
                 )
                 if self._emit_metrics:
+                    # 分别记录客户端调用耗时和服务端报告的搜索耗时。
                     observe_opensearch_search(search_type, client_duration_s, time_took)
             except Exception as e:
+                # 记录搜索阶段的错误后原样抛出，让上游决定如何处理。
                 if self._emit_metrics:
                     record_opensearch_search_error(search_type, e)
                 raise
 
+        # 将原始字典转换为模型；此阶段异常不经过上面的搜索错误指标分支。
         search_hits: list[SearchHit[DocumentChunkWithoutVectors]] = []
         for hit in hits:
             document_chunk_source: dict[str, Any] | None = hit.get("_source")
             if not document_chunk_source:
+                # 缺少片段正文及元数据时无法构建有效结果，直接报错。
                 raise RuntimeError(
                     f'Document chunk with ID "{hit.get("_id", "")}" has no data.'
                 )
+            # 评分和解释可以缺省；未启用高亮或没有高亮结果时使用空字典。
             document_chunk_score = hit.get("_score", None)
             match_highlights: dict[str, list[str]] = hit.get("highlight", {})
             explanation: dict[str, Any] | None = hit.get("_explanation", None)
             search_hit = SearchHit[DocumentChunkWithoutVectors](
+                # 用 Pydantic 校验片段字段，并构建不包含向量的片段模型。
                 document_chunk=DocumentChunkWithoutVectors.model_validate(
                     document_chunk_source
                 ),

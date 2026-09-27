@@ -835,52 +835,71 @@ class OpenSearchDocumentIndex(DocumentIndex):
         self,
         query: str,
         query_embedding: Embedding,
-        # TODO(andrei): This param is not great design, get rid of it.
+        # TODO(andrei)：移除此参数，由调用方统一决定传入的查询文本。
         final_keywords: list[str] | None,
         query_type: QueryType,  # noqa: ARG002
         filters: IndexFilters,
         num_to_retrieve: int,
     ) -> list[InferenceChunk]:
-        # TODO(andrei): There is some duplicated logic in this function with
-        # others in this file.
+        """执行 OpenSearch 混合检索，将搜索命中转换为上游使用的文档片段。
+
+        调用链路（使用 OpenSearch 索引时）：
+            search_chunks → _embed_and_hybrid_search → 本方法。
+        _embed_and_hybrid_search 先生成查询向量，再通过文档索引接口调用本方法。
+
+        本方法调用 DocumentQuery.get_hybrid_search_query 组装向量与关键词查询，
+        然后调用 self._client.search，指定搜索管道进行分数归一化与加权合并。
+        最后转换命中结果并清理片段内容，返回给上游汇总检索结果。
+
+        参数：
+            query：原始查询文本，没有可用的 final_keywords 时用于关键词检索。
+            query_embedding：上游生成的查询向量，不随关键词文本的替换重新计算。
+            final_keywords：非空时以空格拼接，作为关键词检索文本。
+            query_type：接口保留参数，当前 OpenSearch 实现未使用。
+            filters：租户内的权限、来源、标签和知识范围等过滤条件。
+            num_to_retrieve：请求返回的片段数量上限，实际命中可能更少。
+
+        返回：
+            已转换并清理内容的 InferenceChunk 列表，包含得分和匹配高亮信息。
+        """
+        # TODO(andrei)：本方法与文件中的其他方法存在部分重复逻辑。
         logger.debug(
             "[OpenSearchDocumentIndex] Hybrid retrieving %s chunks for index %s.",
             num_to_retrieve,
             self._index_name,
         )
-        # TODO(andrei): This could be better, the caller should just make this
-        # decision when passing in the query param. See the above comment in the
-        # function signature.
+        # 优先使用提取的关键词做文本匹配；向量检索仍使用传入的 query_embedding。
+        # TODO(andrei)：应由调用方在传入 query 时完成文本选择，见参数处的说明。
         final_query = " ".join(final_keywords) if final_keywords else query
+        # 构建完整请求体，应用当前租户和业务过滤条件，并排除隐藏文档。
         query_body = DocumentQuery.get_hybrid_search_query(
             query_text=final_query,
             query_vector=query_embedding,
             num_hits=num_to_retrieve,
             tenant_state=self._tenant_state,
-            # NOTE: Index filters includes metadata tags which were filtered
-            # for invalid unicode at indexing time. In theory it would be
-            # ideal to do filtering here as well, in practice we never did
-            # that in the Vespa codepath and have not seen issues in
-            # production, so we deliberately conform to the existing logic
-            # in order to not unknowningly introduce a possible bug.
+            # 元数据标签在索引阶段已清理无效 Unicode。此处沿用原 Vespa 路径，
+            # 不重复清理查询标签，避免改变既有匹配行为；原路径未发现相关生产问题。
             index_filters=filters,
             include_hidden=False,
         )
+        # 获取与子查询组合对应的评分管道名称；此处引用管道，不创建管道。
         normalization_pipeline_name, _ = get_normalization_pipeline_name_and_config()
+        # 执行实际搜索，由搜索管道统一归一化并合并各路得分。
         search_hits: list[SearchHit[DocumentChunkWithoutVectors]] = self._client.search(
             body=query_body,
             search_pipeline_id=normalization_pipeline_name,
             search_type=OpenSearchSearchType.HYBRID,
         )
 
-        # Good place for a breakpoint to inspect the search hits if you have
-        # "explain" enabled.
+        # 启用 explain 时，可在此处打断点检查命中结果及评分解释。
+        # 将索引中的片段转换为业务模型，同时传入得分和匹配高亮信息。
         inference_chunks_uncleaned: list[InferenceChunkUncleaned] = [
             convert_retrieved_opensearch_chunk_to_inference_chunk_uncleaned(
                 search_hit.document_chunk, search_hit.score, search_hit.match_highlights
             )
             for search_hit in search_hits
         ]
+        # 清理为检索添加的内容，得到上游使用的片段正文。
         inference_chunks: list[InferenceChunk] = cleanup_content_for_chunks(
             inference_chunks_uncleaned
         )
