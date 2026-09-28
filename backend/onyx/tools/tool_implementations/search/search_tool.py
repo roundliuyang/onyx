@@ -489,40 +489,67 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         federated_retrieval_infos: list[FederatedRetrievalInfo],
         effective_filters: BaseFilters | None,
     ) -> list[InferenceChunk]:
-        """Run search pipeline for a single query using pre-fetched data.
+        """使用预取配置执行单条查询，返回经过权限处理的文档片段。
 
-        All DB data (ACL filters, embedding model, federated retrieval info)
-        is pre-fetched in run() so this method needs no DB session.
+        调用链路：
+            run_llm_loop → run_tool_calls → _safe_run_single_tool
+            → SearchTool.run：扩展查询并构建并行检索任务
+               → run_functions_tuples_in_parallel
+                  → _run_search_for_query（本方法，每个任务处理一条查询）
+                     → search_pipeline
+                        → _build_index_filters：组合权限与搜索范围条件
+                        → strip_stopwords：提取关键词
+                        → search_chunks：按来源和参数分发检索
+                           ├─ 普通索引检索启用且 hybrid_alpha 为 0
+                           │  → _keyword_search：纯关键词检索，不生成向量
+                           ├─ 普通索引检索启用且 hybrid_alpha 非 0 或为 None
+                           │  → _embed_and_hybrid_search
+                           │     → get_query_embedding：生成查询向量
+                           │     → document_index.hybrid_retrieval
+                           │        → OpenSearchDocumentIndex.hybrid_retrieval
+                           │        → DocumentQuery.get_hybrid_search_query
+                           │        → OpenSearchIndexClient.search → OpenSearch
+                           └─ 可用的联邦检索函数：查询对应外部数据源
+                        → _post_query_chunk_censoring：按部署实现执行检索后权限处理
+                        → 返回 InferenceChunk 列表
+            → SearchTool.run：融合多查询结果，再执行文档筛选和上下文扩展
 
-        Args:
-            query: The search query string
-            hybrid_alpha: Hybrid search alpha parameter (None for default)
-            num_hits: Maximum number of hits to return
-            acl_filters: Pre-fetched ACL filters for the acting user
-            embedding_model: Pre-fetched embedding model
-            federated_retrieval_infos: Pre-fetched federated retrieval functions
-            effective_filters: Filters for THIS search, with the per-call source
-                scope already applied (computed once in run()).
+        上述索引调用链以 OpenSearch 实现为例，实际分支由来源和参数决定。
+        ACL、嵌入模型及联邦检索配置已由 run 预取，本方法不创建数据库会话。
+        本方法只执行单条查询，多查询融合与最终回答不在此处完成。
 
-        Returns:
-            List of InferenceChunk results
+        参数：
+            query：本次任务使用的查询文本。
+            hybrid_alpha：传给检索层的混合检索参数；None 表示使用默认配置。
+            num_hits：传给检索请求的结果数量限制。
+            acl_filters：预取的当前用户文档访问控制条件。
+            embedding_model：预先构建的嵌入模型，用于生成查询向量。
+            federated_retrieval_infos：预取的联邦检索函数及来源信息。
+            effective_filters：run 已应用本次来源和时间范围的筛选条件；
+                项目模式不传入此项，而是单独传递项目范围和 ACL。
+
+        返回：
+            检索管线返回的文档片段列表；未命中时为空列表。
         """
         logger.info("[RAG_TRACE] search_tool_query -> search_pipeline")
+        # 将单条查询、数量限制与预取上下文统一交给检索管线。
         return search_pipeline(
             chunk_search_request=ChunkSearchRequest(
                 query=query,
                 hybrid_alpha=hybrid_alpha,
-                # For projects, the search scope is the project and has no other limits
+                # 项目模式使用项目范围，不叠加此处的用户筛选；ACL 仍单独传入。
                 user_selected_filters=(
                     effective_filters if self.project_id_filter is None else None
                 ),
                 limit=num_hits,
             ),
+            # 文件索引检索的项目或智能体范围，由下游组合成索引过滤条件。
             project_id_filter=self.project_id_filter,
             persona_id_filter=self.persona_id_filter,
             document_index=self.document_index,
             user=self.user,
             persona_search_info=self.persona_search_info,
+            # 复用已预取的权限、模型和联邦检索配置，避免每条查询重复读取配置。
             acl_filters=acl_filters,
             embedding_model=embedding_model,
             prefetched_federated_retrieval_infos=federated_retrieval_infos,

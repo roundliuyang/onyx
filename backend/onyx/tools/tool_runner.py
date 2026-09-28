@@ -120,24 +120,49 @@ def _safe_run_single_tool(
     tool_call: ToolCallKickoff,
     override_kwargs: Any,
 ) -> ToolResponse:
-    """Execute a single tool and return its response.
+    """执行单个工具，将执行异常转换为模型可读的工具响应。
 
-    This function is designed to be run in parallel via run_functions_tuples_in_parallel.
+    调用链路：
+        run_llm_loop
+        → run_llm_step：获取模型发起的工具调用
+        → run_tool_calls：合并调用、准备上下文并发送工具开始事件
+           → run_functions_tuples_in_parallel：在线程池中调度
+              → _safe_run_single_tool（本方法）
+                 → function_span：记录工具输入、输出和异常
+                 → tool.run：执行实际工具逻辑
+                    └─ SearchTool.run：工具为 internal_search 时执行知识库搜索
+                 → 发送 SectionEnd，关联原始 tool_call
+                 → 返回 ToolResponse
+           → 汇总工具响应和引用映射
+        → run_llm_loop：将工具结果加入历史，供下一步模型调用使用
 
-    Exception handling:
-    - ToolCallException: Expected errors from tool execution (e.g., invalid input,
-      API failures). Uses the exception's llm_facing_message for LLM consumption.
-    - Other exceptions: Unexpected errors. Uses a generic error message.
+    异常处理：
+        ToolCallException：预期的调用错误，使用 llm_facing_message 构造错误响应。
+        ToolExecutionException：执行错误，使用异常文本构造错误响应；
+            emit_error_packet 为 True 时，还向响应流发送 PacketException。
+        其他 Exception：使用异常文本构造通用格式的错误响应。
+        各异常分支均记录日志，并将错误详情和堆栈附加到当前追踪记录。
 
-    In all cases (success or failure):
-    - SectionEnd packet is emitted to signal tool completion
-    - tool_call is set on the response for downstream processing
+    参数：
+        tool：已由调度层选定的工具实例。
+        tool_call：模型发起的调用，包含工具参数、调用 ID 和事件位置。
+        override_kwargs：调度层补充的运行时上下文，如引用起点、历史和用户信息。
+
+    返回：
+        成功结果或错误响应，并通过 tool_call 关联原始调用。
+
+    注意：
+        正常执行或完成上述异常处理后，才会发送 SectionEnd。
+        结束事件不在 finally 中；追踪、异常处理或事件发送自身失败时，
+        异常仍可能向外传播，不能保证始终返回 ToolResponse。
     """
     tool_response: ToolResponse | None = None
 
+    # 为当前工具建立追踪记录，便于定位具体调用及其输入输出。
     with function_span(tool.name) as span_fn:
         span_fn.span_data.input = str(tool_call.tool_args)
         try:
+            # 将模型参数与调度层上下文一起交给工具；实际检索等业务逻辑在此执行。
             tool_response = tool.run(
                 placement=tool_call.placement,
                 override_kwargs=override_kwargs,
@@ -145,8 +170,7 @@ def _safe_run_single_tool(
             )
             span_fn.span_data.output = tool_response.llm_facing_response
         except ToolCallException as e:
-            # ToolCallException is an expected error from tool execution
-            # Use llm_facing_message which is specifically designed for LLM consumption
+            # 参数或外部调用等预期错误：使用专门面向模型的错误说明。
             logger.error("Tool call error for %s: %s", tool.name, e)
             tool_response = ToolResponse(
                 rich_response=None,
@@ -169,7 +193,7 @@ def _safe_run_single_tool(
                 )
             )
         except ToolExecutionException as e:
-            # Unexpected error during tool execution
+            # 执行错误：将异常文本包装为工具响应，让上层获得失败信息。
             logger.error("Unexpected error running tool %s: %s", tool.name, e)
             tool_response = ToolResponse(
                 rich_response=None,
@@ -188,6 +212,7 @@ def _safe_run_single_tool(
                     },
                 )
             )
+            # 按异常配置额外发送流式错误事件；模型侧仍会收到上面的错误响应。
             if e.emit_error_packet:
                 tool.emitter.emit(
                     Packet(
@@ -196,7 +221,7 @@ def _safe_run_single_tool(
                     )
                 )
         except Exception as e:
-            # Unexpected error during tool execution
+            # 兜底处理其他执行异常，保留错误响应而不是直接中断整批工具调用。
             logger.error("Unexpected error running tool %s: %s", tool.name, e)
             tool_response = ToolResponse(
                 rich_response=None,
@@ -216,7 +241,7 @@ def _safe_run_single_tool(
                 )
             )
 
-    # Emit SectionEnd after tool completes (success or failure)
+    # 工具成功或错误已处理后，通知前端当前工具步骤结束。
     tool.emitter.emit(
         Packet(
             placement=tool_call.placement,
@@ -224,7 +249,7 @@ def _safe_run_single_tool(
         )
     )
 
-    # Set tool_call on the response for downstream processing
+    # 关联原始调用，供上层匹配调用 ID、处理结果并追加工具响应消息。
     tool_response.tool_call = tool_call
     return tool_response
 
@@ -426,7 +451,7 @@ def run_tool_calls(
 
         tool_run_params.append((tool, tool_call, override_kwargs))
 
-    # 将工具实例、模型参数和上下文交给安全包装函数，并在线程池执行。
+    # 把每个 (tool, tool_call, override_kwargs) 打包成 _safe_run_single_tool 的参数，交给 run_functions_tuples_in_parallel 并行执行
     functions_with_args = [
         (_safe_run_single_tool, (tool, tool_call, override_kwargs))
         for tool, tool_call, override_kwargs in tool_run_params
