@@ -1569,11 +1569,37 @@ def run_llm_step(
     pre_answer_processing_time: float | None = None,
     stall_timeout_s: int = LLM_SOCKET_READ_TIMEOUT,
 ) -> tuple[LlmStepResult, bool]:
-    """Wrapper around run_llm_step_pkt_generator that consumes packets and emits them.
+    """执行一次模型生成，转发流式事件，并返回本步汇总结果。
 
-    Returns:
-        tuple[LlmStepResult, bool]: The LLM step result and whether reasoning occurred.
+    普通聊天调用链路：
+    run_llm_loop
+    → run_llm_step（本方法）
+       → run_llm_step_pkt_generator：创建事件生成器
+       → next(step_generator)：推进生成器执行
+          → llm.stream：向模型传入消息历史、工具定义和工具选择策略
+          → 处理推理、回答、引用及工具调用增量，yield 事件包
+       → emitter.emit(packet)：将事件交给上层事件输出通道
+       → 重复消费，直到生成器通过 return 返回汇总结果
+       → 从 StopIteration.value 取出 (llm_step_result, has_reasoned)
+    → 返回 run_llm_loop
+       ├─ 有工具调用：run_tool_calls → _safe_run_single_tool → 对应工具.run
+       │  └─ 工具结果加入历史，后续再调用模型生成回答或继续调用工具
+       └─ 无工具调用：由上层处理回答并结束当前循环
+
+    本方法只负责消费和转发模型事件，不执行搜索或其他工具。
+    例如 internal_search 的实际检索发生在上层随后执行 SearchTool.run 时。
+    tool_definitions 描述可用工具，tool_choice 控制本步工具选择策略；
+    传入工具定义并不意味着模型一定会调用工具。
+
+    返回：
+        llm_step_result：汇总的回答、推理文本、工具调用及结束原因。
+        has_reasoned：本步是否发生推理，由底层生成器记录。
+
+    异常：
+        除表示生成结束的 StopIteration 外，其余异常继续向上传播。
     """
+    # 创建生成器；模型请求和事件处理在后续 next() 推进时执行。
+    # 将上下文、引用处理器、输出限制等参数原样交给底层生成流程。
     step_generator = run_llm_step_pkt_generator(
         history=history,
         tool_definitions=tool_definitions,
@@ -1595,8 +1621,12 @@ def run_llm_step(
 
     while True:
         try:
+            # 获取下一个事件包；生成器可能在此等待模型返回新的流式内容。
             packet = next(step_generator)
+            # 立即转发事件，不必等整段回答生成完毕。
             emitter.emit(packet)
         except StopIteration as e:
+            # 生成器的 return 值保存在异常的 value 中，不属于 yield 的事件包。
+            # 返回汇总结果，让上层决定执行工具还是结束本轮回答。
             llm_step_result, has_reasoned = e.value
             return llm_step_result, has_reasoned

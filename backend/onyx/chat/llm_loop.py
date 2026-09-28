@@ -830,6 +830,52 @@ def run_llm_loop(
     all_injected_file_metadata: dict[str, FileToolMetadata] | None = None,
     inject_memories_in_prompt: bool = True,
 ) -> None:
+    """编排一轮聊天中的多步模型生成和工具执行，通过事件通道输出结果。
+
+    普通聊天调用链路：
+    handle_send_chat_message → handle_stream_message_objects → _stream_chat_turn
+    → build_chat_turn（准备会话、模型、工具和历史）
+    → _run_models → run_llm_loop（本方法）
+       → 初始化引用处理器、token 预算和循环状态
+       → 每步选择工具、构建提示词、裁剪消息历史
+       → run_llm_step → run_llm_step_pkt_generator → llm.stream
+          └─ 流式事件通过 emitter 输出，汇总结果返回本方法
+       ├─ 模型直接回答：没有工具调用，退出循环
+       └─ 模型请求工具：run_tool_calls → _safe_run_single_tool → tool.run
+          ├─ internal_search：SearchTool.run → search_pipeline → search_chunks
+          │  → _embed_and_hybrid_search → document_index.hybrid_retrieval
+          │  └─ OpenSearch 后端执行混合检索，结果经筛选和扩展后返回
+          └─ 其他工具：由对应工具实现处理
+          → 收集工具结果、文档、文件和引用映射
+          → 追加 ASSISTANT 工具调用消息和 TOOL_CALL_RESPONSE 结果消息
+          → 下一步模型读取工具结果，继续回答或请求工具
+       → 检查最终回答，发送 OverallStop 结束事件
+
+    搜索不是必经步骤：AUTO 允许模型自行选择工具；搜索内部还可能走
+    纯关键词或联邦检索分支。上述向量检索路径只适用于本地混合检索。
+    普通循环最多执行 MAX_LLM_CYCLES 步；强制工具优先，只在首个适用步生效。
+    非强制工具分支在最后一步或终止类工具执行后禁用工具，要求模型收尾。
+
+    参数：
+        emitter：输出推理、回答、工具和结束事件的通道。
+        state_container：收集工具调用、文档和引用状态，供上层保存。
+        simple_chat_history：可变消息历史，工具调用及响应会追加到此列表。
+        tools / forced_tool_id：可用工具及可选的强制工具 ID。
+        custom_agent_prompt / persona：Agent 提示词与行为配置。
+        context_files / chat_files：上下文文件及工具可访问的附件。
+        user_memory_context / inject_memories_in_prompt：用户信息及记忆注入配置。
+        llm / token_counter：模型实例及 token 计数函数。
+        user_identity / chat_session_id：模型调用身份与链路追踪会话标识。
+        reasoning_effort / include_citations：推理强度与引用输出开关。
+        all_injected_file_metadata：注入文件的元数据，传给消息历史构建逻辑。
+
+    返回：
+        None。回答通过 emitter 输出，相关状态写入 state_container。
+
+    异常：
+        工具不存在或响应缺少关联调用时抛出 ValueError；最终没有有效回答时
+        抛出相应错误。工具有调用却无响应时，先写入失败消息供下一步恢复。
+    """
     with trace(
         "run_llm_loop",
         group_id=chat_session_id,
@@ -838,29 +884,25 @@ def run_llm_loop(
             user_id=user_identity.user_id if user_identity else None,
         ).model_dump(),
     ):
-        # Here for lazy load LiteLLM. initialize_litellm runs once per process.
+        # 延迟加载 LiteLLM；初始化逻辑每个进程只执行一次。
         from onyx.llm.litellm_singleton.config import initialize_litellm
 
         initialize_litellm()
 
-        # Normalize chat_files to a mutable list so we can extend it mid-loop
-        # when a search hit carries an attached file the Python tool should
-        # see.
+        # 复制为可变列表，便于将搜索命中文档的附件加入后续 Python 工具可用文件。
         chat_files = list(chat_files or [])
 
-        # Track when the loop starts for calculating time-to-answer
+        # 记录循环起点，用于计算回答开始前的等待时间。
         loop_start_time = time.monotonic()
 
-        # Initialize citation processor for handling citations dynamically
-        # When include_citations is True, use HYPERLINK mode to format citations as [[1]](url)
-        # When include_citations is False, use REMOVE mode to strip citations from output
+        # 按配置处理引用：启用时生成链接，关闭时从输出中移除引用标记。
         citation_processor = DynamicCitationProcessor(
             citation_mode=(
                 CitationMode.HYPERLINK if include_citations else CitationMode.REMOVE
             )
         )
 
-        # Add project file citation mappings if project files are present
+        # 为直接提供给模型的项目文件建立引用映射。
         project_citation_mapping: CitationMapping = {}
         if context_files.file_metadata:
             project_citation_mapping = _build_context_file_citation_mapping(
@@ -878,9 +920,7 @@ def run_llm_loop(
 
         token_budget = resolve_chat_token_budget(llm)
         available_tokens = token_budget.input_tokens
-        # When the model takes no image input, history images are replayed as
-        # short text markers (translate_history_to_llm_format) — budget them
-        # as markers too, not at their stored image token cost.
+        # 不支持图片输入的模型会将历史图片转换为文本标记，预算也按标记计算。
         image_files_replayed_as_markers = any(
             msg.message_type == MessageType.USER and msg.image_files
             for msg in simple_chat_history
@@ -888,14 +928,13 @@ def run_llm_loop(
             llm.config.model_name, llm.config.model_provider, llm.config.deployment_name
         )
         tool_choice: ToolChoiceOptions = ToolChoiceOptions.AUTO
-        # Initialize gathered_documents with project files if present
+        # 将项目文件加入已收集文档，供引用处理和前端展示。
         gathered_documents: list[SearchDoc] | None = (
             list(project_citation_mapping.values())
             if project_citation_mapping
             else None
         )
-        # TODO allow citing of images in Projects. Since attached to the last user message, it has no text associated with it.
-        # One future workaround is to include the images as separate user messages with citation information and process those.
+        # TODO：支持项目图片引用；可考虑把图片作为带引用信息的独立消息。
         always_cite_documents: bool = bool(
             context_files.use_as_search_filter or context_files.file_texts
         )
@@ -906,10 +945,9 @@ def run_llm_loop(
         has_called_search_tool: bool = False
         code_interpreter_file_generated: bool = False
         fallback_extraction_attempted: bool = False
-        citation_mapping: dict[int, str] = {}  # Maps citation_num -> document_id/URL
+        citation_mapping: dict[int, str] = {}  # 引用编号 → 文档 ID/URL
 
-        # Fetch this in a short-lived session so the long-running stream loop does
-        # not pin a connection just to keep read state alive.
+        # 使用短生命周期会话读取提示词，避免流式生成期间一直占用数据库连接。
         with get_session_with_current_tenant() as prompt_db_session:
             default_base_system_prompt: str = get_default_base_system_prompt(
                 prompt_db_session
@@ -917,11 +955,8 @@ def run_llm_loop(
         system_prompt = None
         custom_agent_prompt_msg = None
 
-        # Resolve author-controlled `{{user.<key>}}` placeholders in the
-        # agent's prompts against the current user's directory profile (+
-        # basic identity) once, before the cycle loop — so every branch below
-        # and every token count sees the final text. Never mutate the shared
-        # `persona`.
+        # 循环前替换提示词中的 {{user.<key>}}，确保各分支和 token 计算使用相同文本。
+        # 不修改共享的 persona 对象。
         placeholder_values = (
             user_memory_context.user_info.placeholder_values
             if user_memory_context
@@ -945,30 +980,28 @@ def run_llm_loop(
 
         reasoning_cycles = 0
         for llm_cycle_count in range(MAX_LLM_CYCLES):
-            # Handling tool calls based on cycle count and past cycle conditions
+            # 根据循环次数、强制工具及前序工具结果，选择本步可用工具。
             out_of_cycles = llm_cycle_count == MAX_LLM_CYCLES - 1
             if forced_tool_id:
-                # Needs to be just the single one because the "required" currently doesn't have a specified tool, just a binary
+                # REQUIRED 只要求调用工具，不能直接指定名称，因此只保留目标工具。
                 final_tools = [tool for tool in tools if tool.id == forced_tool_id]
                 if not final_tools:
                     raise ValueError(f"Tool {forced_tool_id} not found in tools")
                 tool_choice = ToolChoiceOptions.REQUIRED
                 forced_tool_id = None
             elif out_of_cycles or ran_image_gen:
-                # Last cycle, no tools allowed, just answer!
+                # 达到最后一轮或已调用终止类工具时，禁用工具，要求模型生成最终回答。
                 tool_choice = ToolChoiceOptions.NONE
                 final_tools = []
             else:
                 tool_choice = ToolChoiceOptions.AUTO
                 final_tools = tools
 
-            # Handling the system prompt and custom agent prompt
-            # The section below calculates the available tokens for history a bit more accurately
-            # now that project files are loaded in.
+            # 构建系统提示词和自定义 Agent 提示词，纳入时间、记忆及引用要求。
             persona_datetime_aware = persona.datetime_aware if persona else True
             cite_documents = should_cite_documents or always_cite_documents
             if persona and persona.replace_base_system_prompt:
-                # Handles the case where user has checked off the "Replace base system prompt" checkbox
+                # 用户选择替换基础系统提示词时，仅使用 persona 提供的系统提示词。
                 processed_system_prompt = (
                     process_prompt_template(
                         persona_system_prompt,
@@ -990,7 +1023,7 @@ def run_llm_loop(
                 )
                 custom_agent_prompt_msg = None
             else:
-                # If it's an empty string, we assume the user does not want to include it as an empty System message
+                # 基础提示词为空时不创建空的 SYSTEM 消息。
                 if default_base_system_prompt:
                     prompt_memory_context = (
                         user_memory_context
@@ -1033,7 +1066,7 @@ def run_llm_loop(
                         else None
                     )
                 else:
-                    # If there is a custom agent prompt, it replaces the system prompt when the default system prompt is empty
+                    # 没有基础系统提示词时，将自定义 Agent 提示词用作系统提示词。
                     processed_custom_agent_prompt = (
                         process_prompt_template(
                             custom_agent_prompt,
@@ -1086,6 +1119,7 @@ def run_llm_loop(
                 else None
             )
 
+            # 为工具定义预留 token，再按剩余额度构建模型消息历史。
             tool_token_budget = compute_all_tool_tokens(final_tools, token_counter)
             truncated_message_history = construct_message_history(
                 system_prompt=system_prompt,
@@ -1112,12 +1146,10 @@ def run_llm_loop(
                 ),
             )
 
-            # This calls the LLM, yields packets (reasoning, answers, etc.) and returns the result
-            # It also pre-processes the tool calls in preparation for running them
+            # 把工具转换为模型可识别的定义；实际调用由后面的 run_llm_step 发起。
             tool_defs = [tool.tool_definition() for tool in final_tools]
 
-            # Calculate total processing time from loop start until now
-            # This measures how long the user waits before the answer starts streaming
+            # 计算从循环开始到本步调用前的累计耗时，传给回答事件。
             pre_answer_processing_time = time.monotonic() - loop_start_time
 
             llm_step_result, has_reasoned = run_llm_step(
@@ -1129,9 +1161,7 @@ def run_llm_loop(
                 placement=Placement(turn_index=llm_cycle_count + reasoning_cycles),
                 citation_processor=citation_processor,
                 state_container=state_container,
-                # The rich docs representation is passed in so that when yielding the answer, it can also
-                # immediately yield the full set of found documents. This gives us the option to show the
-                # final set of documents immediately if desired.
+                # 传入已收集的完整文档，使回答流能够同时提供引用文档信息。
                 final_documents=gathered_documents,
                 user_identity=user_identity,
                 pre_answer_processing_time=pre_answer_processing_time,
@@ -1141,8 +1171,7 @@ def run_llm_loop(
             if has_reasoned:
                 reasoning_cycles += 1
 
-            # Fallback extraction for LLMs that don't support tool calling natively or are lower quality
-            # and might incorrectly output tool calls in other channels
+            # 兼容未正确使用原生工具调用的模型，尝试从其他输出通道提取工具指令。
             llm_step_result, attempted = _try_fallback_tool_extraction(
                 llm_step_result=llm_step_result,
                 tool_choice=tool_choice,
@@ -1151,14 +1180,13 @@ def run_llm_loop(
                 turn_index=llm_cycle_count + reasoning_cycles,
             )
             if attempted:
-                # To prevent the case of excessive looping with bad models, we only allow one fallback attempt
+                # 整个循环只允许一次兜底提取，避免反复尝试。
                 fallback_extraction_attempted = True
 
-            # Save citation mapping after each LLM step for incremental state updates
+            # 每步模型调用后保存引用映射，支持增量状态更新。
             state_container.set_citation_mapping(citation_processor.citation_to_doc)
 
-            # Run the LLM selected tools, there is some more logic here than a simple execution
-            # each tool might have custom logic here
+            # 获取本步模型选择的工具调用；没有调用时使用空列表。
             tool_responses: list[ToolResponse] = []
             tool_calls = llm_step_result.tool_calls or []
 
@@ -1185,19 +1213,15 @@ def run_llm_loop(
                     )
                 )
 
-            # Quick note for why citation_mapping and citation_processors are both needed:
-            # 1. Tools return lightweight string mappings, not SearchDoc objects
-            # 2. The SearchDoc resolution is deliberately deferred to llm_loop.py
-            # 3. The citation_processor operates on SearchDoc objects and can't provide a complete reverse URL lookup for
-            # in-flight citations
-            # It can be cleaned up but not super trivial or worthwhile right now
+            # 工具返回“引用编号 → 文档 ID/URL”的轻量映射；本层再处理 SearchDoc。
+            # 引用处理器负责输出引用，两种映射承担不同职责。
             just_ran_web_search = False
             parallel_tool_call_results = run_tool_calls(
                 tool_calls=tool_calls,
                 tools=final_tools,
                 message_history=truncated_message_history,
                 user_memory_context=user_memory_context,
-                user_info=None,  # TODO, this is part of memories right now, might want to separate it out
+                user_info=None,  # TODO：用户信息目前包含在记忆上下文中，后续可独立传递
                 citation_mapping=citation_mapping,
                 next_citation_num=citation_processor.get_next_citation_number(),
                 max_concurrent_tools=None,
@@ -1209,7 +1233,7 @@ def run_llm_loop(
             tool_responses = parallel_tool_call_results.tool_responses
             citation_mapping = parallel_tool_call_results.updated_citation_mapping
 
-            # Failure case, give something reasonable to the LLM to try again
+            # 有工具调用却没有工具响应时，补入失败消息，让下一轮模型尝试恢复。
             if tool_calls and not tool_responses:
                 failure_messages = create_tool_call_failure_messages(
                     tool_calls, token_counter
@@ -1218,18 +1242,18 @@ def run_llm_loop(
                 continue
 
             for tool_response in tool_responses:
-                # Extract tool_call from the response (set by run_tool_calls)
+                # 工具调度器必须为响应关联原始工具调用，供结果配对和持久化。
                 if tool_response.tool_call is None:
                     raise ValueError("Tool response missing tool_call reference")
 
                 tool_call = tool_response.tool_call
                 tab_index = tool_call.placement.tab_index
 
-                # Track if search tool was called (for skipping query expansion on subsequent calls)
+                # 记录搜索工具已执行，后续搜索跳过重复的查询扩展。
                 if tool_call.tool_name == SearchTool.NAME:
                     has_called_search_tool = True
 
-                # Track if code interpreter generated files with download links
+                # 记录代码解释器是否生成文件，以便下一轮提示模型提供下载链接。
                 if (
                     tool_call.tool_name == PythonTool.NAME
                     and not code_interpreter_file_generated
@@ -1243,23 +1267,21 @@ def run_llm_loop(
 
                 tools_by_name = {tool.name: tool for tool in final_tools}
 
-                # Add the results to the chat history. Even though tools may run in parallel,
-                # LLM APIs require linear history, so results are added sequentially.
-                # Get the tool object to retrieve tool_id
+                # 查找工具实例以取得 tool_id；并行执行的结果在后面按线性消息序列写入历史。
                 tool = tools_by_name.get(tool_call.tool_name)
                 if not tool:
                     raise ValueError(
                         f"Tool '{tool_call.tool_name}' not found in tools list"
                     )
 
-                # Extract search_docs if this is a search tool response
+                # 提取搜索类工具返回的文档和展示文档。
                 search_docs = None
                 displayed_docs = None
                 if isinstance(tool_response.rich_response, SearchDocsResponse):
                     search_docs = tool_response.rich_response.search_docs
                     displayed_docs = tool_response.rich_response.displayed_docs
 
-                    # Add ALL search docs to state container for DB persistence
+                    # 将全部搜索文档加入状态容器，供后续持久化。
                     if search_docs:
                         state_container.add_search_docs(search_docs)
 
@@ -1268,14 +1290,11 @@ def run_llm_loop(
                     else:
                         gathered_documents = search_docs
 
-                    # This is used for the Open URL reminder in the next cycle
-                    # only do this if the web search tool yielded results
+                    # 仅在网页搜索命中文档时，启用下一轮的打开 URL 提示。
                     if search_docs and tool_call.tool_name == WebSearchTool.NAME:
                         just_ran_web_search = True
 
-                    # Stage any raw source files attached to these hits into
-                    # the session's chat_files so the next Python tool call
-                    # sees them already uploaded under their display names.
+                    # 将命中文档对应的原始附件加入 chat_files，供后续 Python 工具使用。
                     if search_docs:
                         staged = build_python_chat_files_from_search_docs(
                             search_docs=search_docs,
@@ -1288,21 +1307,21 @@ def run_llm_loop(
                                 if cf.filename not in existing_filenames
                             )
 
-                # Extract generated_images if this is an image generation tool response
+                # 提取图片生成工具的输出。
                 generated_images = None
                 if isinstance(
                     tool_response.rich_response, FinalImageGenerationResponse
                 ):
                     generated_images = tool_response.rich_response.generated_images
 
-                # Extract generated_files if this is a code interpreter response
+                # 提取代码解释器生成的文件。
                 generated_files = None
                 if isinstance(tool_response.rich_response, PythonToolRichResponse):
                     generated_files = (
                         tool_response.rich_response.generated_files or None
                     )
 
-                # Custom tools save image/CSV blobs and return their ids.
+                # 自定义工具保存图片或 CSV 等文件，并返回文件 ID。
                 generated_file_ids = None
                 if isinstance(
                     tool_response.rich_response, CustomToolCallSummary
@@ -1313,13 +1332,11 @@ def run_llm_loop(
                         tool_response.rich_response.tool_result.file_ids or None
                     )
 
-                # Persist memory if this is a memory tool response
+                # 处理记忆工具响应，按当前会话模式决定是否保存。
                 memory_snapshot: MemoryToolResponseSnapshot | None = None
                 incognito_memory_refusal: str | None = None
                 if isinstance(tool_response.rich_response, MemoryToolResponse):
-                    # Any incognito mode refuses memory writes with an explicit
-                    # error, so neither the model nor the user sees a saved
-                    # memory that does not exist.
+                    # 无痕模式明确拒绝记忆写入，避免向模型或用户声称已保存。
                     if get_current_incognito_record_mode() is not None:
                         incognito_memory_refusal = (
                             "Error: memories cannot be saved from an incognito "
@@ -1353,7 +1370,7 @@ def run_llm_loop(
 
                 if incognito_memory_refusal:
                     saved_response = incognito_memory_refusal
-                    # The next LLM cycle must see the refusal too.
+                    # 把拒绝信息也返回给下一轮模型。
                     tool_response.llm_facing_response = incognito_memory_refusal
                 elif memory_snapshot:
                     saved_response = json.dumps(memory_snapshot.model_dump())
@@ -1367,13 +1384,13 @@ def run_llm_loop(
                     saved_response = tool_response.llm_facing_response
 
                 tool_call_info = ToolCallInfo(
-                    parent_tool_call_id=None,  # Top-level tool calls are attached to the chat message
+                    parent_tool_call_id=None,  # 顶层工具调用关联到聊天消息
                     turn_index=llm_cycle_count + reasoning_cycles,
                     tab_index=tab_index,
                     tool_name=tool_call.tool_name,
                     tool_call_id=tool_call.tool_call_id,
                     tool_id=tool.id,
-                    reasoning_tokens=llm_step_result.reasoning,  # All tool calls from this loop share the same reasoning
+                    reasoning_tokens=llm_step_result.reasoning,  # 本步工具调用共享同一份推理文本
                     tool_call_arguments=tool_call.tool_args,
                     tool_call_response=saved_response,
                     search_docs=displayed_docs or search_docs,
@@ -1381,31 +1398,29 @@ def run_llm_loop(
                     generated_files=generated_files,
                     generated_file_ids=generated_file_ids,
                 )
-                # Add to state container for partial save support
+                # 将工具调用结果加入状态容器，支持部分结果保存。
                 state_container.add_tool_call(tool_call_info)
 
-                # Update citation processor if this was a search tool
+                # 根据工具响应更新引用处理器。
                 update_citation_processor_from_tool_response(
                     tool_response, citation_processor
                 )
 
-            # After processing all tool responses for this turn, add messages to history
-            # using OpenAI parallel tool calling format:
-            # 1. ONE ASSISTANT message with tool_calls array
-            # 2. N TOOL_CALL_RESPONSE messages (one per tool call)
+            # 按并行工具调用协议写入历史：一条 ASSISTANT 消息包含所有工具调用，
+            # 随后每个调用对应一条 TOOL_CALL_RESPONSE 消息。
             if tool_responses:
-                # Filter to only responses with valid tool_call references
+                # 仅保留已关联原始工具调用的响应。
                 valid_tool_responses = [
                     tr for tr in tool_responses if tr.tool_call is not None
                 ]
 
-                # Build ToolCallSimple list for all tool calls in this turn
+                # 构建本步所有工具调用的简化表示，并计算 token 数。
                 tool_calls_simple: list[ToolCallSimple] = []
                 for tool_response in valid_tool_responses:
                     tc = tool_response.tool_call
                     assert (
                         tc is not None
-                    )  # Already filtered above, this is just for typing purposes
+                    )  # 上面已过滤，此断言用于类型收窄
 
                     tool_call_message = tc.to_msg_str()
                     tool_call_token_count = token_counter(tool_call_message)
@@ -1419,10 +1434,10 @@ def run_llm_loop(
                         )
                     )
 
-                # Create ONE ASSISTANT message with all tool calls for this turn
+                # 用一条 ASSISTANT 消息记录本步全部工具调用。
                 total_tool_call_tokens = sum(tc.token_count for tc in tool_calls_simple)
                 assistant_with_tools = ChatMessageSimple(
-                    message="",  # No text content when making tool calls
+                    message="",  # 该消息仅记录工具调用
                     token_count=total_tool_call_tokens,
                     message_type=MessageType.ASSISTANT,
                     tool_calls=tool_calls_simple,
@@ -1430,10 +1445,10 @@ def run_llm_loop(
                 )
                 simple_chat_history.append(assistant_with_tools)
 
-                # Add TOOL_CALL_RESPONSE messages for each tool call
+                # 逐条追加工具响应，并通过 tool_call_id 与调用关联。
                 for tool_response in valid_tool_responses:
                     tc = tool_response.tool_call
-                    assert tc is not None  # Already filtered above
+                    assert tc is not None  # 上面已过滤空引用
 
                     tool_response_message = tool_response.llm_facing_response
                     tool_response_token_count = token_counter(tool_response_message)
@@ -1447,11 +1462,11 @@ def run_llm_loop(
                     )
                     simple_chat_history.append(tool_response_msg)
 
-            # If no tool calls, then it must have answered, wrap up
+            # 没有后续工具调用时退出循环；最终回答是否有效由循环后的检查确认。
             if not llm_step_result.tool_calls or len(llm_step_result.tool_calls) == 0:
                 break
 
-            # Certain tools do not allow further actions, force the LLM wrap up on the next cycle
+            # 部分工具要求下一轮直接收尾，不允许继续调用工具。
             if any(
                 tool.tool_name in STOPPING_TOOLS_NAMES
                 for tool in llm_step_result.tool_calls
@@ -1462,9 +1477,10 @@ def run_llm_loop(
                 tool.tool_name in CITEABLE_TOOLS_NAMES
                 for tool in llm_step_result.tool_calls
             ):
-                # As long as 1 tool with citeable documents is called at any point, we ask the LLM to try to cite
+                # 调用过可引用文档的工具后，后续提示词加入引用要求。
                 should_cite_documents = True
 
+        # 循环退出不代表生成成功；分别检查空输出和只有工具调用的情况。
         if not llm_step_result.answer and not llm_step_result.tool_calls:
             raise _build_empty_llm_response_error(
                 llm=llm,
