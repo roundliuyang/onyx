@@ -232,63 +232,67 @@ def _safe_run_single_tool(
 def run_tool_calls(
     tool_calls: list[ToolCallKickoff],
     tools: list[Tool],
-    # The stuff below is needed for the different individual built-in tools
+    # 以下上下文参数供不同的内置工具使用。
     message_history: list[ChatMessageSimple],
     user_memory_context: UserMemoryContext | None,
     user_info: str | None,
     citation_mapping: dict[int, str],
     next_citation_num: int,
-    # Max number of tools to run concurrently (and overall) in this batch.
-    # If set, tool calls beyond this limit are dropped.
+    # 同时限制本批次的调用总数和并发数；超出上限的调用直接丢弃，不排队。
     max_concurrent_tools: int | None = None,
-    # Skip query expansion for repeat search tool calls
+    # 重复调用搜索工具时，可跳过查询扩展。
     skip_search_query_expansion: bool = False,
-    # Files from the chat session to pass to tools like PythonTool
+    # 会话文件，供 PythonTool 等工具读取。
     chat_files: list[ChatFile] | None = None,
-    # A map of url -> summary for passing web results to open url tool
+    # URL 到摘要的映射，将网页搜索结果传给打开网页的工具。
     url_snippet_map: dict[str, str] | None = None,
-    # When False, don't pass memory context to search tools for query expansion
-    # (but still pass it to the memory tool for persistence)
+    # 为 False 时，搜索查询扩展不使用记忆；记忆工具仍接收完整记忆上下文。
     inject_memories_in_prompt: bool = True,
 ) -> ParallelToolCallResponse:
-    """Run (optionally merged) tool calls in parallel and update citation mappings.
+    """合并并并行执行一批工具调用，汇总工具响应和引用映射。
 
-    Before execution, tool calls for `SearchTool`, `WebSearchTool`, and `OpenURLTool`
-    are merged so repeated calls are collapsed into a single call per tool:
-    - `SearchTool` / `WebSearchTool`: merge the `queries` list
-    - `OpenURLTool`: merge the `urls` list
+    聊天主流程中的调用链路：
+        run_llm_loop
+        → run_llm_step：获取模型生成的工具调用
+        → run_tool_calls（本方法）
+           → _merge_tool_calls：合并搜索查询或待打开的 URL
+           → 过滤未知工具，按批次上限截断调用列表
+           → 准备各工具的上下文参数与引用起始编号
+           → run_functions_tuples_in_parallel：在线程池中执行
+              → _safe_run_single_tool
+                 → tool.run：执行具体工具
+                    └─ SearchTool.run：本地知识库搜索入口
+                 → 返回 ToolResponse，并发送工具结束事件
+           → 合并搜索结果的引用映射，返回 ParallelToolCallResponse
+        → run_llm_loop：将工具结果加入历史，继续调用模型生成回答或选择工具
 
-    Tools are executed in parallel (threadpool). For tools that generate citations,
-    each tool call is assigned a **distinct** `starting_citation_num` range to avoid
-    citation number collisions when running concurrently (the range is advanced by
-    100 per tool call).
+    本方法负责工具调度；实际检索由 SearchTool 等具体工具完成。
+    SearchTool 和 WebSearchTool 合并 queries，OpenURLTool 合并 urls。
+    引用类工具的起始编号按 100 递增，预留引用空间；这不是结果数量限制。
+    citation_mapping 会被原地更新，调用方可以继续使用同一份映射。
 
-    The provided `citation_mapping` may be mutated in-place: any new
-    `SearchDocsResponse.citation_mapping` entries are merged into it.
+    参数：
+        tool_calls：模型请求执行的工具调用。
+        tools：本轮可用的工具实例，按工具名称匹配。
+        message_history：聊天历史，用于提取最近的用户问题及工具所需上下文。
+        user_memory_context：用户信息与记忆，供搜索和记忆工具使用。
+        user_info：传给搜索工具的用户信息文本。
+        citation_mapping：已有的引用编号到 URL 的映射。
+        next_citation_num：可分配的下一个引用编号。
+        max_concurrent_tools：本批次调用数量与线程数上限；超出部分直接丢弃。
+        skip_search_query_expansion：是否跳过搜索查询扩展，供重复搜索时使用。
+        chat_files：传给 PythonTool 等工具的会话文件。
+        url_snippet_map：URL 到摘要的映射，供 OpenURLTool 使用。
+        inject_memories_in_prompt：是否向搜索工具传入记忆；不影响记忆工具的上下文。
 
-    Args:
-        tool_calls: List of tool calls to execute.
-        tools: List of available tool instances.
-        message_history: Chat message history (used to find the most recent user query
-            for `SearchTool` override kwargs).
-        user_memory_context: User memory context, if available (passed through to `SearchTool`).
-        user_info: User information string, if available (passed through to `SearchTool`).
-        citation_mapping: Current citation number to URL mapping. May be updated with
-            new citations produced by search tools.
-        next_citation_num: The next citation number to allocate from.
-        max_concurrent_tools: Max number of tools to run in this batch. If set, any
-            tool calls after this limit are dropped (not queued).
-        skip_search_query_expansion: Whether to skip query expansion for `SearchTool`
-            (intended for repeated search calls within the same chat turn).
+    返回：
+        工具响应列表与更新后的引用映射。工具内部异常通常转换为错误响应；
+        在线程池层执行失败并返回 None 的条目会被排除。
 
-    Returns:
-        A `ParallelToolCallResponse` containing:
-        - `tool_responses`: `ToolResponse` objects for successfully dispatched tool calls
-          (each has `tool_call` set). If a tool execution fails at the threadpool layer,
-          its entry will be omitted.
-        - `updated_citation_mapping`: The updated citation mapping dictionary.
+    异常：
+        ValueError：调用 SearchTool 时，聊天历史中没有用户消息。
     """
-    # Merge tool calls for SearchTool, WebSearchTool, and OpenURLTool
+    # 合并同类搜索与网页打开调用，减少重复调度。
     if url_snippet_map is None:
         url_snippet_map = {}
     merged_tool_calls = _merge_tool_calls(tool_calls)
@@ -301,7 +305,7 @@ def run_tool_calls(
 
     tools_by_name = {tool.name: tool for tool in tools}
 
-    # Drop unknown tools (and don't let them count against the cap)
+    # 先丢弃未知工具，避免它们占用本批次的调用名额。
     filtered_tool_calls: list[ToolCallKickoff] = []
     for tool_call in merged_tool_calls:
         if tool_call.tool_name not in tools_by_name:
@@ -309,7 +313,7 @@ def run_tool_calls(
             continue
         filtered_tool_calls.append(tool_call)
 
-    # Apply safety cap (drop tool calls beyond the cap)
+    # 按上限截断有效调用；非正数表示本批次不执行任何工具。
     if max_concurrent_tools is not None:
         if max_concurrent_tools <= 0:
             return ParallelToolCallResponse(
@@ -318,10 +322,10 @@ def run_tool_calls(
             )
         filtered_tool_calls = filtered_tool_calls[:max_concurrent_tools]
 
-    # Get starting citation number from citation processor to avoid conflicts with project files
+    # 使用调用方提供的引用起点，避开已有项目文件的引用编号。
     starting_citation_num = next_citation_num
 
-    # Prepare minimal history for SearchTool (computed once, shared by all)
+    # 仅保留消息文本与角色，供搜索和记忆工具共享。
     minimal_history = [
         ChatMinimalTextMessage(message=msg.message, message_type=msg.message_type)
         for msg in message_history
@@ -332,19 +336,18 @@ def run_tool_calls(
             last_user_message = minimal_history[i].message
             break
 
-    # Convert citation_mapping for OpenURLTool (computed once, shared by all)
+    # 反转已有引用映射，让 OpenURLTool 按 URL 查找引用编号。
     url_to_citation: dict[str, int] = {
         url: citation_num for citation_num, url in citation_mapping.items()
     }
 
-    # Prepare all tool calls with their override_kwargs
-    # Each tool gets a unique starting citation number to avoid conflicts when running in parallel
+    # 为各工具准备运行时上下文；引用类工具使用不同的引用起点。
     tool_run_params: list[tuple[Tool, ToolCallKickoff, Any]] = []
 
     for tool_call in filtered_tool_calls:
         tool = tools_by_name[tool_call.tool_name]
 
-        # Emit the tool start packet before running the tool
+        # 在线程池执行前发送开始事件，供前端显示工具步骤。
         tool.emit_start(placement=tool_call.placement)
 
         override_kwargs: (
@@ -361,6 +364,7 @@ def run_tool_calls(
             if last_user_message is None:
                 raise ValueError("No user message found in message history")
 
+            # 关闭记忆注入时，仅移除记忆内容，保留其余用户上下文。
             search_memory_context = (
                 user_memory_context
                 if inject_memories_in_prompt
@@ -378,15 +382,14 @@ def run_tool_calls(
                 user_info=user_info,
                 skip_query_expansion=skip_search_query_expansion,
             )
-            # Increment citation number for next search tool to avoid conflicts
-            # Estimate: reserve 100 citation slots per search tool
+            # 为本次搜索预留 100 个引用编号，再分配下一个工具的起点。
             starting_citation_num += 100
 
         elif isinstance(tool, WebSearchTool):
             override_kwargs = WebSearchToolOverrideKwargs(
                 starting_citation_num=starting_citation_num,
             )
-            # Increment citation number for next search tool to avoid conflicts
+            # 为网页搜索预留 100 个引用编号。
             starting_citation_num += 100
 
         elif isinstance(tool, OpenURLTool):
@@ -404,6 +407,7 @@ def run_tool_calls(
         elif isinstance(tool, CodingAgentTool):
             override_kwargs = CodingAgentToolOverrideKwargs()
         elif isinstance(tool, MemoryTool):
+            # 记忆工具始终接收已有记忆，以便处理记忆更新。
             override_kwargs = MemoryToolOverrideKwargs(
                 user_name=(
                     user_memory_context.user_info.name if user_memory_context else None
@@ -422,7 +426,7 @@ def run_tool_calls(
 
         tool_run_params.append((tool, tool_call, override_kwargs))
 
-    # Run all tools in parallel
+    # 将工具实例、模型参数和上下文交给安全包装函数，并在线程池执行。
     functions_with_args = [
         (_safe_run_single_tool, (tool, tool_call, override_kwargs))
         for tool, tool_call, override_kwargs in tool_run_params
@@ -430,12 +434,12 @@ def run_tool_calls(
 
     tool_run_results: list[ToolResponse | None] = run_functions_tuples_in_parallel(
         functions_with_args,
-        allow_failures=True,  # Continue even if some tools fail
+        allow_failures=True,  # 单个任务失败时，仍收集其他任务的结果。
         max_workers=max_concurrent_tools,
         timeout=TOOL_EXECUTION_TIMEOUT_SECONDS,
     )
 
-    # Process results and update citation_mapping
+    # 线程池完成后统一合并引用，跳过未返回响应的任务。
     for result in tool_run_results:
         if result is None:
             continue
@@ -443,7 +447,7 @@ def run_tool_calls(
         if result and isinstance(result.rich_response, SearchDocsResponse):
             new_citations = result.rich_response.citation_mapping
             if new_citations:
-                # Merge new citations into the existing mapping
+                # 原地加入新引用，供后续回答中的引用解析使用。
                 citation_mapping.update(new_citations)
 
     tool_responses = [result for result in tool_run_results if result is not None]

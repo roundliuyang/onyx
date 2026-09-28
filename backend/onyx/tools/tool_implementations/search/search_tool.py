@@ -268,6 +268,8 @@ def _trim_sections_by_tokens(
 
 
 class SearchTool(Tool[SearchToolOverrideKwargs]):
+    """内部搜索工具：检索已连接的数据源，筛选文档并生成回答所需的引用上下文。"""
+
     NAME = "internal_search"
     DISPLAY_NAME = "Internal Search"
     DESCRIPTION = "Search connected applications for information."
@@ -276,27 +278,30 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         self,
         tool_id: int,
         emitter: Emitter,
-        # Used for ACLs and federated search, anonymous users only see public docs
+        # 用于访问控制和联邦搜索；匿名用户只能访问公开文档。
         user: User,
-        # Pre-extracted persona search configuration
+        # 预先提取的智能体搜索配置。
         persona_search_info: PersonaSearchInfo,
         llm: LLM,
         document_index: DocumentIndex,
-        # Respecting user selections
+        # 用户选择的搜索筛选条件。
         user_selected_filters: BaseFilters | None,
-        # Vespa metadata filters for overflowing user files.  NOT the raw IDs
-        # of the current project/persona — only set when user files couldn't
-        # fit in the LLM context and need to be searched via vector DB.
+        # 文件无法全部放入模型上下文时，用项目或智能体 ID 限定索引检索范围。
+        # 这些是搜索过滤条件，不是无条件传入的当前项目或智能体 ID。
         project_id_filter: int | None,
         persona_id_filter: int | None = None,
-        # Slack context for federated Slack search (tokens fetched internally)
+        # Slack 联邦搜索的上下文；访问凭据在内部获取。
         slack_context: SlackContext | None = None,
-        # Whether to enable Slack federated search
+        # 是否启用 Slack 联邦搜索。
         enable_slack_search: bool = True,
-        # Whether to infer source and time filters from the
-        # query. When False, only user/persona-selected filters are applied.
+        # 是否从问题推断来源和时间范围；关闭时仅使用用户或智能体的筛选条件。
         auto_detect_filters: bool = True,
     ) -> None:
+        """保存搜索依赖和配置，并初始化同一工具实例的搜索状态。
+
+        初始化仅保存依赖，不执行检索。工具调度层匹配 internal_search 后，
+        经 run_tool_calls → _safe_run_single_tool → run 触发实际搜索。
+        """
         super().__init__(emitter=emitter)
 
         self.user = user
@@ -310,8 +315,11 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         self.enable_slack_search = enable_slack_search
         self.auto_detect_filters = auto_detect_filters
 
+        # 记录本实例已搜索的查询与来源，供重复搜索时决定下一步范围。
         self._search_cycles: list[SearchCycle] = []
+        # 缓存查询扩展，切换来源时可复用。
         self._cached_expansion: tuple[str | None, list[str]] | None = None
+        # 分别记录来源决策、时间范围及时间推断是否已完成。
         self._scope_decision_settled = False
         self._time_filter: TimeFilter | None = None
         self._time_filter_computed = False
@@ -665,9 +673,50 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         override_kwargs: SearchToolOverrideKwargs,
         **llm_kwargs: Any,
     ) -> ToolResponse:
+        """执行内部知识库搜索，返回模型可读的文档文本及结构化引用。
+
+        调用链路：
+            run_llm_loop → run_tool_calls → _safe_run_single_tool
+            → SearchTool.run（本方法）
+               → 预取 ACL、嵌入模型与联邦检索配置
+               → _expand_queries_and_decide_scope：扩展查询，确定来源和时间范围
+               → 并行执行 _run_search_for_query
+                  → search_pipeline：构建检索请求与过滤条件
+                  → search_chunks：分发索引检索和联邦检索
+                     → _embed_and_hybrid_search（启用普通混合检索时）
+                        → get_query_embedding：生成查询向量
+                        → document_index.hybrid_retrieval
+                           → OpenSearchDocumentIndex.hybrid_retrieval（OpenSearch 实现）
+                           → DocumentQuery.get_hybrid_search_query
+                           → OpenSearchIndexClient.search → OpenSearch
+               → weighted_reciprocal_rank_fusion：融合多查询排名
+               → merge_individual_chunks：合并片段，限制候选数量
+               → select_sections_for_expansion：LLM 筛选相关内容
+               → expand_section_with_context：并行扩展文档上下文
+               → merge_overlapping_sections：合并重叠内容
+               → convert_inference_sections_to_llm_string：生成文本和引用映射
+               → ToolResponse → run_llm_loop：将结果加入模型上下文
+
+        实际分支取决于来源、过滤条件和索引配置；不是每次都执行向量搜索。
+        Slack 搜索在条件满足时单独并行执行；无候选结果时提前返回空响应。
+        本方法返回检索材料，最终面向用户的回答由后续模型调用生成。
+
+        参数：
+            placement：本次工具事件在响应流中的位置。
+            override_kwargs：调度层传入的原始问题、历史、记忆、引用起点及数量限制。
+            llm_kwargs：模型生成的工具参数，必须包含 queries。
+
+        返回：
+            ToolResponse，包含文档、引用映射、展示文档及供模型读取的文本。
+
+        异常：
+            ToolCallException：缺少 queries 参数。
+            OnyxError：用户无权访问指定文档集。
+            RuntimeError：未配置搜索设置。
+            检索等步骤的其他异常交由上层工具执行包装函数处理。
+        """
         logger.info("[RAG_TRACE] search_tool_run")
-        # Malformed calls fail loudly whatever the source selection says, so
-        # the argument check comes before any short-circuit.
+        # 先校验必填参数，再处理空来源等提前返回分支，避免掩盖错误调用。
         if QUERIES_FIELD not in llm_kwargs:
             raise ToolCallException(
                 message=f"Missing required '{QUERIES_FIELD}' parameter in internal_search tool call",
@@ -678,10 +727,8 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 ),
             )
 
-        # An explicitly empty source selection is a statement, not an absent
-        # filter: the tool still runs (it may be forced), and it honestly
-        # finds nothing. `None` keeps its meaning of "no source filter".
-        # Project mode ignores user filters entirely, so the guard must too.
+        # 显式空来源列表表示不搜索任何来源；None 表示不限制来源。
+        # 项目模式忽略用户筛选条件，因此不受此空列表判断影响。
         if (
             self.user_selected_filters is not None
             and self.project_id_filter is None
@@ -701,24 +748,23 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 llm_facing_response=empty_response,
             )
 
-        # Start overall timing
+        # 记录整个搜索工具的执行耗时。
         overall_start_time = time.time()
 
-        # Initialize timing variables (in case of early exceptions)
+        # 初始化筛选与扩展耗时。
         document_selection_elapsed = 0.0
         document_expansion_elapsed = 0.0
 
         connected_sources: list[DocumentSource] = []
 
-        # Pre-fetch all DB data in a single short-lived session so that
-        # parallel search workers need zero DB connections.
+        # 在短生命周期会话中预取权限、模型和联邦搜索配置，供并行检索使用。
         with get_session_with_current_tenant() as db_session:
-            # ACL filters
+            # 构建当前用户的文档访问控制条件。
             acl_filters: list[str] = build_access_filters_for_user(
                 self.user, db_session
             )
 
-            # Validate document-set access for user-supplied filters.
+            # 校验用户指定的文档集权限，拒绝访问未授权的文档集。
             if (
                 self.user_selected_filters
                 and self.user_selected_filters.document_set
@@ -740,8 +786,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                         f"User does not have access to document sets: {unauthorized}",
                     )
 
-            # SearchSettings → materialise EmbeddingModel while session is
-            # open (forces lazy-load of cloud_provider properties)
+            # 在会话关闭前构建嵌入模型，完成云提供方属性的延迟加载。
             search_settings = get_current_search_settings(db_session)
             if not search_settings:
                 raise RuntimeError(
@@ -754,9 +799,9 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 server_port=MODEL_SERVER_PORT,
             )
 
-            # Federated retrieval functions (non-Slack; Slack is separate)
+            # 预取非 Slack 的联邦检索函数；Slack 单独处理。
             if self.project_id_filter is not None:
-                # Project mode ignores user filters → no federated sources
+                # 项目模式不使用用户指定的来源条件进行预取。
                 prefetch_source_types = None
             else:
                 prefetch_source_types = (
@@ -775,12 +820,11 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 or []
             )
 
-            # Project mode ignores user filters, so source scoping doesn't apply.
+            # 非项目模式读取已连接来源，供后续搜索范围决策使用。
             if self.project_id_filter is None:
                 connected_sources = fetch_unique_document_sources(db_session)
 
-            # Slack tokens and entity config — only prefetch when Slack
-            # search is enabled or we're in a Slack bot context.
+            # 启用 Slack 搜索或存在 Slack 机器人上下文时，才预取凭据和实体配置。
             if self.enable_slack_search or self.slack_context:
                 slack_access_token, slack_bot_token, slack_entities = (
                     self._prefetch_slack_data(db_session)
@@ -791,12 +835,11 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                     None,
                     {},
                 )
-        # Session is closed here — all parallel work uses plain Python objects only
+        # 预取会话在此关闭，后续检索使用已提取的数据。
 
         llm_queries = cast(list[str], llm_kwargs[QUERIES_FIELD])
 
-        # Run semantic and keyword query expansion in parallel (unless skipped)
-        # Use message history, memories, and user info from override_kwargs
+        # 从运行时参数中提取历史、记忆和用户信息，供查询扩展使用。
         message_history = override_kwargs.message_history or []
         memories = (
             override_kwargs.user_memory_context.as_formatted_list()
@@ -805,7 +848,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         )
         user_info = override_kwargs.user_info
 
-        # A persona/user source restriction is the outer bound the decision works within.
+        # 来源决策必须在用户选择的来源范围内进行。
         user_source_restriction: list[DocumentSource] | None = (
             list(self.user_selected_filters.source_type)
             if self.user_selected_filters and self.user_selected_filters.source_type
@@ -844,8 +887,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             [s.value for s in resolved_scope] if resolved_scope else "all sources",
         )
 
-        # On a repeat call that advanced to a not-yet-searched source, reuse the
-        # cached expansion (it is source-agnostic) rather than searching raw queries.
+        # 重复搜索切换到新来源时，复用与来源无关的查询扩展缓存。
         searched_sources = {
             value for cycle in self._search_cycles for value in cycle.searched_sources
         }
@@ -871,9 +913,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             )
         )
 
-        # Surface the applied filters (source scope + time window) to the UI. Scope
-        # is reported only when it narrows to a strict subset — scoping to all
-        # connected sources is equivalent to an unscoped search.
+        # 向前端发送来源与时间筛选条件；覆盖全部来源时不显示来源收窄。
         scopes_all_sources = bool(connected_sources) and set(
             connected_sources
         ).issubset(resolved_scope or [])
@@ -914,11 +954,11 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 for info in federated_retrieval_infos
                 if info.source.to_non_federated_source() in resolved_scope
             ]
-            # Disable the Slack federated search when Slack is out of scope.
+            # Slack 不在本次搜索范围内时，禁用它的联邦搜索。
             if DocumentSource.SLACK not in resolved_scope:
                 slack_access_token = None
 
-        # The pipeline composes the lower bound with any persona time floor.
+        # 应用推断的时间范围；检索管线还会结合智能体配置的时间下限。
         if time_filter is not None:
             effective_filters = time_filter.apply_to(effective_filters or BaseFilters())
             logger.info(
@@ -928,15 +968,13 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 time_filter.end.isoformat() if time_filter.end else "any",
             )
 
-        # Prepare queries with their weights and hybrid_alpha settings
-        # Group 1: Keyword queries (use hybrid_alpha=0.2)
+        # 准备关键词查询及融合权重；检索参数使用 KEYWORD_QUERY_HYBRID_ALPHA。
         keyword_queries_with_weights = [
             (kw_query, LLM_KEYWORD_QUERY_WEIGHT) for kw_query in keyword_queries
         ]
         deduplicated_keyword_queries = deduplicate_queries(keyword_queries_with_weights)
 
-        # Group 2: Semantic/LLM/Original queries (use hybrid_alpha=None)
-        # Include all LLM-provided queries with their weight
+        # 准备语义改写、模型查询和原始问题；这些查询使用默认混合检索参数。
         semantic_queries_with_weights = (
             [
                 (semantic_query, LLM_SEMANTIC_QUERY_WEIGHT),
@@ -944,7 +982,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             if semantic_query
             else []
         )
-        # In rare cases, the LLM may fail to provide real queries
+        # 忽略模型偶尔返回的空查询。
         semantic_queries_with_weights.extend(
             (llm_query, LLM_NON_CUSTOM_QUERY_WEIGHT)
             for llm_query in llm_queries
@@ -958,14 +996,13 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             semantic_queries_with_weights
         )
 
-        # Build the all_queries list for UI display, sorted by weight (highest first)
-        # Combine all deduplicated queries and sort by weight
+        # 合并两组查询，按权重降序生成前端展示列表。
         all_queries_with_weights = (
             deduplicated_semantic_queries + deduplicated_keyword_queries
         )
         all_queries_with_weights.sort(key=lambda x: x[1], reverse=True)
 
-        # Extract queries in weight order, handling cross-duplicates
+        # 展示列表按大小写不敏感去重；实际检索任务仍按各自分组构建。
         all_queries = []
         seen_lower = set()
         for query, _ in all_queries_with_weights:
@@ -980,7 +1017,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             [q for q, _ in deduplicated_keyword_queries],
         )
 
-        # Emit the queries early so the UI can display them immediately
+        # 检索开始前发送查询列表，让前端及时显示搜索内容。
         self.emitter.emit(
             Packet(
                 placement=placement,
@@ -990,13 +1027,11 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             )
         )
 
-        # Run all searches in parallel with appropriate hybrid_alpha values
-        # Keyword queries use hybrid_alpha=0.2 (favor keyword search)
-        # Other queries use default hybrid_alpha (balanced semantic/keyword)
+        # 构建并行任务及对应的融合权重；每个查询分别执行检索管线。
         search_functions: list[tuple[Callable, tuple]] = []
         search_weights: list[float] = []
 
-        # Add deduplicated semantic queries (use hybrid_alpha=None)
+        # 语义查询传入 None，使用下游默认的混合检索配置。
         for query, weight in deduplicated_semantic_queries:
             search_functions.append(
                 (
@@ -1014,7 +1049,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             )
             search_weights.append(weight)
 
-        # Add deduplicated keyword queries (use hybrid_alpha=0.2)
+        # 关键词查询传入配置的混合检索参数；具体行为由下游索引实现决定。
         for query, weight in deduplicated_keyword_queries:
             search_functions.append(
                 (
@@ -1032,10 +1067,8 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             )
             search_weights.append(weight)
 
-        # Add Slack federated search (runs once in parallel with all Vespa queries)
-        # This avoids the query multiplication problem where each Vespa query
-        # would trigger a separate Slack search.
-        # Only run if pre-fetch found a valid Slack access token.
+        # 有有效凭据和原始问题时，额外执行一次 Slack 联邦搜索。
+        # 它与索引检索并行，避免每条扩展查询都重复触发 Slack 搜索。
         if slack_access_token and override_kwargs.original_query:
             search_functions.append(
                 (
@@ -1049,24 +1082,22 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                     ),
                 )
             )
-            # Use same weight as original query for Slack results
+            # Slack 结果使用与原始问题相同的融合权重。
             search_weights.append(ORIGINAL_QUERY_WEIGHT)
 
-        # Run all searches in parallel (Vespa queries + Slack)
+        # 并行执行索引检索与可用的 Slack 联邦搜索。
         all_search_results = run_functions_tuples_in_parallel(search_functions)
         if not all_search_results:
             all_search_results = []
 
-        # Merge results using weighted Reciprocal Rank Fusion
-        # This intelligently combines rankings from different queries
+        # 按查询权重执行倒数排名融合（RRF），以文档 ID 与片段 ID 标识结果。
         top_chunks = weighted_reciprocal_rank_fusion(
             ranked_results=all_search_results,
             weights=search_weights,
             id_extractor=lambda chunk: f"{chunk.document_id}_{chunk.chunk_id}",
         )
 
-        # We can disregard all of the chunks that exceed the num_hits parameter since it's not valid to have
-        # documents/contents from things that aren't returned to the user on the frontend
+        # 将片段合并为 section，并按 num_hits 截断，限制后续处理的候选范围。
         top_sections = merge_individual_chunks(top_chunks)[: override_kwargs.num_hits]
 
         if not top_sections:
@@ -1084,12 +1115,11 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 llm_facing_response=empty_response,
             )
 
-        # Enrich chunks with `Document.file_id` (Postgres-only metadata not
-        # stored in Vespa).
+        # 从 PostgreSQL 补充 Document.file_id；该元数据不保存在搜索索引中。
         with get_session_with_current_tenant() as enrichment_session:
             populate_file_ids_on_sections(top_sections, enrichment_session)
 
-        # Convert InferenceSections to SearchDocs for emission
+        # 将候选 section 转为结构化文档，供工具响应使用。
         search_docs = convert_inference_sections_to_search_docs(
             top_sections, is_internet=False
         )
@@ -1102,18 +1132,14 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
 
         token_counter = get_llm_token_counter(self.llm)
 
-        # Trim sections to fit within token budget before LLM selection
-        # This is to account for very short chunks flooding the search context
-        # Only consider MAX_CHUNKS_FOR_RELEVANCE chunks per section to avoid flooding from
-        # documents with many matching sections
+        # 在 LLM 筛选前按 token 预算裁剪，并限制每个 section 的片段数量。
         max_tokens_for_selection = (
             (override_kwargs.max_llm_chunks or MAX_CHUNKS_FED_TO_CHAT)
             * DOC_EMBEDDING_CONTEXT_SIZE
             * SELECTION_TOKEN_BUDGET_MULTIPLIER
         )
 
-        # This is approximate since it doesn't build the exact string of the call below
-        # Some things are estimated and may be under (like the metadata tokens)
+        # 这是近似预算，未构造实际提示词，元数据等 token 数可能被低估。
         sections_for_selection = _trim_sections_by_tokens(
             sections=top_sections,
             max_tokens=max_tokens_for_selection,
@@ -1121,10 +1147,10 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             max_chunks_per_section=MAX_CHUNKS_FOR_RELEVANCE,
         )
 
-        # Start timing for LLM document selection
+        # 记录 LLM 文档筛选的开始时间。
         document_selection_start_time = time.time()
 
-        # Use LLM to select the most relevant sections for expansion
+        # 让 LLM 选出相关 section，以及需要重点扩展的文档。
         selected_sections, best_doc_ids = select_sections_for_expansion(
             sections=sections_for_selection,
             user_query=secondary_flows_user_query,
@@ -1132,7 +1158,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             max_chunks_per_section=MAX_CHUNKS_FOR_RELEVANCE,
         )
 
-        # End timing for LLM document selection
+        # 记录 LLM 筛选耗时与选中数量。
         document_selection_elapsed = time.time() - document_selection_start_time
         logger.debug(
             "Search tool - LLM picking documents took %s seconds (selected %s sections)",
@@ -1140,10 +1166,10 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             len(selected_sections),
         )
 
-        # Create a set of best document IDs for quick lookup
+        # 用集合快速判断 section 是否属于重点扩展文档。
         best_doc_ids_set = set(best_doc_ids) if best_doc_ids else set()
 
-        # To show the users, we only pass in the docs that are determined to be good by the LLM
+        # 向前端展示 LLM 筛选后的文档。
         final_ui_docs = convert_inference_sections_to_search_docs(
             selected_sections, is_internet=False
         )
@@ -1157,7 +1183,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             )
         )
 
-        # Create wrapper function to handle errors gracefully
+        # 封装上下文扩展；单个 section 扩展失败时保留原文。
         def expand_section_safe(
             section: InferenceSection,
             user_query: str,
@@ -1165,7 +1191,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             document_index: DocumentIndex,
             expand_override: bool,
         ) -> InferenceSection:
-            """Wrapper that handles exceptions and returns original section on error."""
+            """扩展 section 的上下文；出现异常时返回原始 section。"""
             try:
                 expanded_section = expand_section_with_context(
                     section=section,
@@ -1174,7 +1200,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                     document_index=document_index,
                     expand_override=expand_override,
                 )
-                # Return expanded section if not None, otherwise original
+                # 扩展未返回结果时，回退到原始 section。
                 return expanded_section if expanded_section is not None else section
             except Exception as e:
                 logger.warning(
@@ -1183,7 +1209,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
                 )
                 return section
 
-        # Build parallel function calls for all sections
+        # 为每个选中的 section 构建上下文扩展任务。
         expansion_functions: list[tuple[Callable, tuple]] = [
             (
                 expand_section_safe,
@@ -1198,13 +1224,13 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             for section in selected_sections
         ]
 
-        # Start timing for document expansion
+        # 记录上下文扩展的开始时间。
         document_expansion_start_time = time.time()
 
-        # Run all expansions in parallel
+        # 并行扩展选中的 section。
         expanded_sections = run_functions_tuples_in_parallel(expansion_functions)
 
-        # End timing for document expansion
+        # 记录扩展耗时和返回数量。
         document_expansion_elapsed = time.time() - document_expansion_start_time
         logger.debug(
             "Search tool - Expansion of selected documents took %s seconds (expanded %s sections)",
@@ -1215,8 +1241,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         if not expanded_sections:
             expanded_sections = selected_sections
 
-        # Merge sections from the same document that have adjacent or overlapping chunks
-        # This prevents duplicate content and reduces token usage
+        # 合并同一文档中相邻或重叠的 section，减少重复内容和 token 消耗。
         merged_sections = merge_overlapping_sections(expanded_sections)
 
         docs_str, citation_mapping = convert_inference_sections_to_llm_string(
@@ -1228,7 +1253,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             note=scope_note or None,
         )
 
-        # End overall timing
+        # 记录整个搜索工具的耗时。
         overall_elapsed = time.time() - overall_start_time
         logger.debug(
             "Search tool - Total execution time: %s seconds (document selection: %ss, document expansion: %ss)",
@@ -1240,12 +1265,12 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         llm_facing_response = docs_str
 
         return ToolResponse(
-            # Typically the rich response will give more docs in case it needs to be displayed in the UI
+            # 保留候选文档、引用映射和实际展示文档，供调用方处理。
             rich_response=SearchDocsResponse(
                 search_docs=search_docs,
                 citation_mapping=citation_mapping,
                 displayed_docs=final_ui_docs,
             ),
-            # The LLM facing response typically includes less docs to cut down on noise and token usage
+            # 返回经过数量限制的文档文本，供模型生成回答。
             llm_facing_response=llm_facing_response,
         )
