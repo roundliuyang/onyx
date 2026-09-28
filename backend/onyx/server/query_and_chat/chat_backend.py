@@ -810,6 +810,60 @@ def handle_send_chat_message(
     """
     发送新的聊天消息，根据请求配置返回流式响应或完整结果。
 
+    单模型本地知识库问答链路（模型选择 internal_search 时）：
+    以下括号中的数值来自一次实测，仅用于理解流程，不是固定配置。
+
+    POST /api/chat/send-chat-message
+    → handle_send_chat_message
+    → handle_stream_message_objects
+    → _stream_chat_turn
+    → build_chat_turn：准备会话、历史、文件上下文、模型和工具
+       └─ 搜索策略 AUTO，未直接注入文件全文（本次实测）
+    → _run_models
+    → run_llm_loop
+       → run_llm_step：模型发起 internal_search
+       → run_tool_calls
+       → _safe_run_single_tool
+       → SearchTool.run
+          → 查询改写、扩展，确定搜索范围（本次为 file）
+          → 并行执行检索查询（本次 6 个）
+             → _run_search_for_query
+             → search_pipeline：构建权限和业务过滤条件
+             → search_chunks：选择本地混合检索分支
+             → _embed_and_hybrid_search
+             → get_query_embedding：生成查询向量（本次 768 维）
+             → OpenSearchDocumentIndex.hybrid_retrieval
+             → DocumentQuery.get_hybrid_search_query：构建混合查询
+             → OpenSearchIndexClient.search
+             → opensearchpy.OpenSearch.search：发送请求
+             → OpenSearch 混合检索及搜索管道评分归一化、融合
+             → 返回文档片段（本次每个查询返回 35 个，可能互相重叠）
+             → 内容清理、结果合并去重及 search_pipeline 后处理
+          → weighted_reciprocal_rank_fusion：融合多查询排名
+          → merge_individual_chunks：合并文档片段
+          → select_sections_for_expansion：LLM 筛选（本次选中 1 个 section）
+          → expand_section_with_context：按需扩展文档上下文
+             └─ 可能按文档 ID 再次查询索引
+          → merge_overlapping_sections：合并重叠内容
+          → convert_inference_sections_to_llm_string：组织文本和引用映射
+          → 返回 ToolResponse
+       → 将工具结果加入消息历史，作为后续模型上下文
+       → 再次调用 run_llm_step：模型生成带文件引用的回答
+       → 没有后续工具调用时，结束模型循环
+    → 事件序列化后逐个返回客户端
+    → 流式响应结束
+
+    分支说明：
+        - 无命中时，搜索工具返回空结果；模型可以换词再搜或结束回答。
+        - 非流式请求复用消息处理流程，由 gather_stream_full 汇总完整结果。
+        - 深度研究使用专用编排，不属于上面的普通问答路径。
+        - AUTO 仅允许模型选择搜索，不保证调用搜索工具；直接回答会跳过检索。
+        - 默认 Assistant 在项目中文件已放入上下文或无可搜索文件时可禁用搜索。
+        - search_chunks 可并行执行联邦检索；本地检索是否启用取决于来源过滤。
+        - hybrid_alpha 显式为 0 时走 _keyword_search，不生成查询向量；
+          其他值走混合检索。实际向量维度、召回数量和模型取决于运行配置。
+        - 多模型流式请求从 handle_multi_model_stream 进入，不能视为上述单模型路径。
+
     参数：
         chat_message_req (SendMessageRequest)：新消息及其配置。
             - stream=True（默认）：返回 StreamingResponse 流式响应。
@@ -822,6 +876,11 @@ def handle_send_chat_message(
     返回：
         StreamingResponse | ChatFullResponse：流式响应或完整聊天结果。
     """
+    logger.info(
+        "[RAG_TRACE] send_chat_message stream=%s deep_research=%s",
+        chat_message_req.stream,
+        chat_message_req.deep_research,
+    )
     # 此时尚未加载会话的无痕模式设置，因此只记录会话 ID。
     # 不记录提示词原文，避免无痕消息留存在持久化日志中。
     logger.debug(

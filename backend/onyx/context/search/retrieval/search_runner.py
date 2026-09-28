@@ -59,6 +59,7 @@ def _embed_and_hybrid_search(
         db_session=db_session,
         embedding_model=embedding_model,
     )
+    logger.info("[RAG_TRACE] query_embedding_ready dimensions=%d", len(query_embedding))
 
     hybrid_alpha = query_request.hybrid_alpha or HYBRID_ALPHA
 
@@ -71,6 +72,7 @@ def _embed_and_hybrid_search(
         filters=query_request.filters,
         num_to_retrieve=query_request.limit or NUM_RETURNED_HITS,
     )
+    logger.info("[RAG_TRACE] hybrid_retrieval_complete chunks=%d", len(top_chunks))
 
     return top_chunks
 
@@ -161,9 +163,16 @@ def search_chunks(
     normal_search_enabled = (source_filters is None) or (
         len(set(source_filters) - federated_sources) > 0
     )
+    logger.info(
+        "[RAG_TRACE] search_chunks local_enabled=%s federated_tasks=%d hybrid_alpha=%s",
+        normal_search_enabled,
+        len(federated_retrieval_infos),
+        query_request.hybrid_alpha,
+    )
 
     if normal_search_enabled:
         if query_request.hybrid_alpha is not None and query_request.hybrid_alpha == 0.0:
+            logger.info("[RAG_TRACE] local_branch=keyword")
             # 显式指定 0 才走纯关键词检索，省去查询向量计算。
             # 当前由支持 OpenSearch 的调用方使用；Vespa 的 keyword_retrieval
             # 会抛出 NotImplementedError。
@@ -174,6 +183,7 @@ def search_chunks(
                 )
             )
         else:
+            logger.info("[RAG_TRACE] local_branch=hybrid")
             # 其他情况先计算查询向量，再调用索引的混合检索接口。
             run_queries.append(
                 (
@@ -186,6 +196,11 @@ def search_chunks(
     parallel_search_results = run_functions_tuples_in_parallel(run_queries)
     # 按 (document_id, chunk_id) 去重并排序；缺失得分按 0 处理。
     top_chunks = combine_retrieval_results(parallel_search_results)
+    logger.info(
+        "[RAG_TRACE] retrieval_merged tasks=%d chunks=%d",
+        len(run_queries),
+        len(top_chunks),
+    )
 
     if not top_chunks:
         logger.debug(

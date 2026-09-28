@@ -421,6 +421,13 @@ def extract_context_files(
     max_actual_tokens = (
         llm_max_context_window - reserved_token_count
     ) * max_llm_context_percentage
+    logger.info(
+        "[RAG_TRACE] context_files files=%d tokens=%d budget=%.0f overflow=%s",
+        len(user_files),
+        aggregate_tokens,
+        max_actual_tokens,
+        aggregate_tokens >= max_actual_tokens,
+    )
 
     if aggregate_tokens >= max_actual_tokens:
         use_as_search_filter = not DISABLE_VECTOR_DB
@@ -569,6 +576,12 @@ def determine_search_params(
         elif files_loaded_in_context or not has_context_files:
             search_usage = SearchToolUsage.DISABLED
 
+    logger.info(
+        "[RAG_TRACE] search_params usage=%s context_texts=%d use_as_search_filter=%s",
+        search_usage,
+        len(extracted_context_files.file_texts),
+        extracted_context_files.use_as_search_filter,
+    )
     return SearchParams(
         project_id_filter=project_id_filter,
         persona_id_filter=persona_id_filter,

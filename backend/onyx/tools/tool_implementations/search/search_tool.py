@@ -499,6 +499,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         Returns:
             List of InferenceChunk results
         """
+        logger.info("[RAG_TRACE] search_tool_query -> search_pipeline")
         return search_pipeline(
             chunk_search_request=ChunkSearchRequest(
                 query=query,
@@ -664,6 +665,7 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
         override_kwargs: SearchToolOverrideKwargs,
         **llm_kwargs: Any,
     ) -> ToolResponse:
+        logger.info("[RAG_TRACE] search_tool_run")
         # Malformed calls fail loudly whatever the source selection says, so
         # the argument check comes before any short-circuit.
         if QUERIES_FIELD not in llm_kwargs:

@@ -1606,6 +1606,11 @@ class OpenSearchIndexClient(OpenSearchClient):
         )
         result: dict[str, Any]
         # 请求服务端返回各搜索阶段的耗时，用于性能日志。
+        logger.info(
+            "[RAG_TRACE] opensearch_search type=%s pipeline=%s",
+            search_type,
+            search_pipeline_id,
+        )
         params = {"phase_took": "true"}
         # 启用指标时统计请求次数和正在执行的请求数，否则使用空上下文。
         ctx = self._get_emit_metrics_context_manager(search_type)
@@ -1672,6 +1677,7 @@ class OpenSearchIndexClient(OpenSearchClient):
             self._index_name,
             len(search_hits),
         )
+        logger.info("[RAG_TRACE] opensearch_search_complete hits=%d", len(search_hits))
         return search_hits
 
     @log_function_time(print_only=True, debug_only=True)
