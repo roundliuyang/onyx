@@ -695,44 +695,48 @@ def get_azure_file_store() -> "AzureBlobBackedFileStore":
 
 
 def get_default_file_store() -> FileStore:
-    """
-    Returns the configured file store implementation based on FILE_STORE_BACKEND.
+    """根据 FILE_STORE_BACKEND 配置返回对应的文件存储实现。
 
-    When FILE_STORE_BACKEND=postgres:
-    - Files are stored in PostgreSQL using Large Objects.
-    - No external storage service (S3/MinIO) is required.
+    FILE_STORE_BACKEND=postgres：
+    - 文件以 Large Object 形式存在 PostgreSQL 中。
+    - 不依赖任何外部存储服务（S3/MinIO）。
 
-    When FILE_STORE_BACKEND=s3 (default):
-    - Supports AWS S3, MinIO, and other S3-compatible storage.
-    - Configuration via environment variables:
-      - S3_FILE_STORE_BUCKET_NAME, S3_ENDPOINT_URL, S3_AWS_ACCESS_KEY_ID, etc.
+    FILE_STORE_BACKEND=s3（默认）：
+    - 支持 AWS S3、MinIO 及其他 S3 协议兼容存储。
+    - 通过环境变量配置：
+      - S3_FILE_STORE_BUCKET_NAME、S3_ENDPOINT_URL、S3_AWS_ACCESS_KEY_ID 等。
 
-    When FILE_STORE_BACKEND=gcs:
-    - Uses Google Cloud Storage with ADC/Workload Identity or service account keys.
-    - Configuration via environment variables:
-      - GCS_FILE_STORE_BUCKET_NAME, GCS_PROJECT_ID, GCS_SERVICE_ACCOUNT_KEY_PATH, etc.
+    FILE_STORE_BACKEND=gcs：
+    - 使用 Google Cloud Storage，支持 ADC/Workload Identity 或服务账号密钥。
+    - 通过环境变量配置：
+      - GCS_FILE_STORE_BUCKET_NAME、GCS_PROJECT_ID、GCS_SERVICE_ACCOUNT_KEY_PATH 等。
 
-    When FILE_STORE_BACKEND=azure:
-    - Uses Azure Blob Storage with connection string, account key, or
-      DefaultAzureCredential (AKS Workload Identity / managed identity).
-    - Configuration via environment variables:
-      - AZURE_FILE_STORE_CONTAINER_NAME, AZURE_STORAGE_ACCOUNT_NAME,
-        AZURE_STORAGE_CONNECTION_STRING, AZURE_STORAGE_ACCOUNT_KEY, etc.
+    FILE_STORE_BACKEND=azure：
+    - 使用 Azure Blob Storage，支持连接字符串、账号密钥或
+      DefaultAzureCredential（AKS Workload Identity / 托管身份）。
+    - 通过环境变量配置：
+      - AZURE_FILE_STORE_CONTAINER_NAME、AZURE_STORAGE_ACCOUNT_NAME、
+        AZURE_STORAGE_CONNECTION_STRING、AZURE_STORAGE_ACCOUNT_KEY 等。
     """
     from onyx.configs.app_configs import FILE_STORE_BACKEND
     from onyx.configs.constants import FileStoreType
 
+    # 把配置字符串解析成枚举；非法值会在构造 FileStoreType 时报错。
     backend = FileStoreType(FILE_STORE_BACKEND)
 
+    # PostgreSQL 后端：文件以 Large Object 存入关系库。
     if backend == FileStoreType.POSTGRES:
         from onyx.file_store.postgres_file_store import PostgresBackedFileStore
 
         return PostgresBackedFileStore()
 
+    # Google Cloud Storage 后端。
     if backend == FileStoreType.GCS:
         return get_gcs_file_store()
 
+    # Azure Blob Storage 后端。
     if backend == FileStoreType.AZURE:
         return get_azure_file_store()
 
+    # 未命中上述分支时默认回退到 S3（兼容 MinIO 等 S3 协议存储）。
     return get_s3_file_store()

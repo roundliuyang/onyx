@@ -339,23 +339,35 @@ def upload_files(
     返回：
         FileUploadResponse，含去重后的 file_paths、file_names 与 zip 元数据 ID。
     """
-    # 跳过目录和已知的 macOS 元数据项
     def should_process_file(file_path: str) -> bool:
+        """判断 zip 内的某个条目是否需要处理。
+
+        用 os.path.normpath 先归一化路径（消掉 ./ 、重复分隔符等噪声段），
+        再按分隔符拆成各段逐段判断：只要任一段以 "." 开头就返回 False，跳过。
+        这样可以滤掉隐藏文件/目录，以及 macOS 打包 zip 时夹带的元数据，
+        例如 ._Foo（AppleDouble 资源叉）和 .DS_Store。
+        注：真正的目录条目由上游 is_dir() 判断处理，不在这里。
+        """
         normalized_path = os.path.normpath(file_path)
         return not any(part.startswith(".") for part in normalized_path.split(os.sep))
 
+    # 两个平行列表按顺序记录每个已存储文件的 id 与展示名，最终一起返回。
     deduped_file_paths = []
     deduped_file_names = []
+    # zip 展开时用于存放整包元数据的文件 id；非 zip 或未展开时保持 None。
     zip_metadata_file_id: str | None = None
     try:
         file_store = get_default_file_store()
+        # 一批只允许一个 zip；第二次遇到 zip 直接报错。
         seen_zip = False
         for file in files:
+            # 没有文件名的条目无法落盘和展示，跳过。
             if not file.filename:
                 logger.warning("File has no filename, skipping")
                 continue
 
             if is_zip_file(file):
+                # 已有 zip 再来一个 zip：拒绝，避免元数据来源混淆。
                 if seen_zip:
                     raise HTTPException(status_code=400, detail=SEEN_ZIP_DETAIL)
                 seen_zip = True
@@ -363,18 +375,23 @@ def upload_files(
                 # 通过打开 zip 来校验其有效性（可发现损坏或非 zip 文件）
                 with zipfile.ZipFile(file.file, "r") as zf:
                     if unzip:
+                        # 先校验解压后总大小上限，防 zip 炸弹。
                         assert_zip_within_limits(zf, max_total_bytes=MAX_UNZIPPED_BYTES)
                         unzipped_bytes: int
+                        # 另存一份 zip 元数据文件，返回其 id 与元数据占用的字节数。
                         zip_metadata_file_id, unzipped_bytes = (
                             save_zip_metadata_to_file_store(zf, file_store)
                         )
                         for file_info in zf.namelist():
+                            # 目录条目本身不存储。
                             if zf.getinfo(file_info).is_dir():
                                 continue
 
+                            # 跳过隐藏项与 macOS 元数据（见 should_process_file）。
                             if not should_process_file(file_info):
                                 continue
 
+                            # 读取内层文件字节；单文件与累计总量都受上限约束。
                             sub_file_bytes: bytes = read_zip_member(
                                 zf,
                                 zf.getinfo(file_info),
@@ -385,6 +402,7 @@ def upload_files(
                             )
                             unzipped_bytes += len(sub_file_bytes)
 
+                            # 按文件名推断 MIME，未知则退化为二进制流。
                             mime_type, __ = mimetypes.guess_type(file_info)
                             if mime_type is None:
                                 mime_type = "application/octet-stream"
@@ -397,6 +415,7 @@ def upload_files(
                             )
                             deduped_file_paths.append(file_id)
                             deduped_file_names.append(os.path.basename(file_info))
+                        # 该 zip 已在展开分支处理完，进入下一个上传项。
                         continue
 
                 # 按原样保存整个 zip（unzip=False）
@@ -411,6 +430,7 @@ def upload_files(
                 deduped_file_names.append(file.filename)
                 continue
 
+            # 普通文件：直接把原始字节流写入文件存储。
             file_id = file_store.save_file(
                 content=file.file,
                 display_name=file.filename,
@@ -420,8 +440,10 @@ def upload_files(
             deduped_file_paths.append(file_id)
             deduped_file_names.append(file.filename)
 
+    # zip 超出大小上限：属于用户输入问题，转成 400 业务错误。
     except ZipSizeLimitError as e:
         raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(e)) from e
+    # 其他值错误（如损坏的 zip 等）：按 400 返回给前端。
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return FileUploadResponse(
