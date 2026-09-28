@@ -1581,26 +1581,55 @@ def create_connector_from_model(
     ),
     db_session: Session = Depends(get_session),
 ) -> ObjectCreationIdResponse:
-    # No GATE 2: creates only the Connector row (no cc_pair, no group/access
-    # binding yet). Scope is enforced at credential association.
+    """创建一条 Connector 记录（仅本体，不含凭证/cc-pair 绑定）。
+
+    File Connector 流程的第二步（接在 upload_files_api 之后）：
+        POST /admin/connector（本接口）：写入 source（如 FILE）与 connector_specific_config
+        → 后续通过凭证关联建立 cc-pair，才真正触发索引
+
+    步骤：
+        1. 校验连接器类型是否被系统启用（_validate_connector_allowed）。
+        2. 校验需要起始日期的源型是否传了 indexing_start（_validate_indexing_start）。
+        3. 转成 ConnectorBase 并落库，返回新对象 id。
+        4. 上报遥测与审计事件。
+
+    参数：
+        connector_data：前端提交的连接器创建请求。
+        user：依赖注入的当前用户，需持有 MANAGE_CONNECTORS。
+        db_session：依赖注入的数据库会话。
+
+    返回：
+        ObjectCreationIdResponse，含新建 Connector 的 id。
+
+    异常：
+        ValueError（被捕获后转 400）：连接器类型被管理员禁用。
+        OnyxError：缺少必需的 indexing_start 起始日期。
+    """
+    # 不做 GATE 2：此步只建 Connector 行（尚无 cc-pair、无群组/访问绑定）。
+    # 范围约束在凭证关联时才执行。
     tenant_id = get_current_tenant_id()
 
     try:
+        # 校验该连接器类型是否在系统启用白名单内；禁用时抛 ValueError。
         _validate_connector_allowed(connector_data.source)
+        # 部分源型必须提供起始日期，缺失时报无效输入。
         _validate_indexing_start(connector_data)
 
+        # 将创建请求转为内部 ConnectorBase 模型，再写入数据库得到连接器行。
         connector_base = connector_data.to_connector_base()
         connector_response = create_connector(
             db_session=db_session,
             connector_data=connector_base,
         )
 
+        # 多租户云版遥测：记录“已创建连接器”里程碑。
         mt_cloud_telemetry(
             tenant_id=tenant_id,
             distinct_id=str(user.id),
             event=MilestoneRecordType.CREATED_CONNECTOR,
         )
 
+        # 审计：记录本次连接器创建成功。
         emit_audit_event(
             AuditAction.CONNECTOR_CREATE,
             AuditOutcome.SUCCESS,
@@ -1611,6 +1640,7 @@ def create_connector_from_model(
         )
         return connector_response
     except ValueError as e:
+        # 类型禁用等参数错：回 400。
         logger.error("Error creating connector: %s", e)
         raise HTTPException(status_code=400, detail=str(e))
 
