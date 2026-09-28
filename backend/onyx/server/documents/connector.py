@@ -323,7 +323,23 @@ def upload_files(
     file_origin: FileOrigin = FileOrigin.CONNECTOR,
     unzip: bool = True,
 ) -> FileUploadResponse:
-    # Skip directories and known macOS metadata entries
+    """把上传的文件（含 zip 处理）写入文件存储，返回文件 ID 与名称。
+
+    逐个处理 files：
+        - 普通文件：直接 save_file，记录 file_id 与文件名。
+        - zip 且 unzip=True：校验大小上限，展开内层文件逐个存储，
+          另存一份 zip 元数据（zip_metadata_file_id）；跳过目录与隐藏项。
+        - zip 且 unzip=False：按原样保存整个 zip。
+    一批只允许一个 zip，重复出现报 400。
+
+    参数：
+        file_origin：写入文件存储的来源标记，用于后续权限判定。
+        unzip：是否展开 zip 内容；False 时原样保存。
+
+    返回：
+        FileUploadResponse，含去重后的 file_paths、file_names 与 zip 元数据 ID。
+    """
+    # 跳过目录和已知的 macOS 元数据项
     def should_process_file(file_path: str) -> bool:
         normalized_path = os.path.normpath(file_path)
         return not any(part.startswith(".") for part in normalized_path.split(os.sep))
@@ -344,7 +360,7 @@ def upload_files(
                     raise HTTPException(status_code=400, detail=SEEN_ZIP_DETAIL)
                 seen_zip = True
 
-                # Validate the zip by opening it (catches corrupt/non-zip files)
+                # 通过打开 zip 来校验其有效性（可发现损坏或非 zip 文件）
                 with zipfile.ZipFile(file.file, "r") as zf:
                     if unzip:
                         assert_zip_within_limits(zf, max_total_bytes=MAX_UNZIPPED_BYTES)
@@ -383,7 +399,7 @@ def upload_files(
                             deduped_file_names.append(os.path.basename(file_info))
                         continue
 
-                # Store the zip as-is (unzip=False)
+                # 按原样保存整个 zip（unzip=False）
                 file.file.seek(0)
                 file_id = file_store.save_file(
                     content=file.file,
@@ -472,8 +488,22 @@ def upload_files_api(
         require_permission(Permission.MANAGE_CONNECTORS, allow_scope=True)
     ),
 ) -> FileUploadResponse:
-    # No GATE 2: there is no resource to scope yet, since this only stores bytes and
-    # returns ids. The manager is held to their groups when the credential is associated.
+    """上传文件字节，供创建或更新 File Connector 时引用。
+
+    File Connector 添加流程的第一步：
+        upload_files_api（本接口）：只存储字节，返回 file_ids
+        → POST /admin/connector：用 file_locations/file_names 创建 source=FILE 的连接器
+        → POST /admin/connector/{id}/files/update：向已有连接器增删文件
+
+    参数：
+        files：待上传的文件列表，可包含 zip。
+        unzip：为 True 时展开 zip 逐个存储内层文件；False 时按原样保存 zip。
+
+    返回：
+        FileUploadResponse，含 file_paths、file_names 及 zip 元数据文件 ID。
+    """
+    # 不做 GATE 2：此步只存字节并返回 id，尚无资源可做范围鉴权。
+    # 群组管理员的范围约束在凭证关联时才生效。
     return upload_files(files, FileOrigin.CONNECTOR_FILE_UPLOAD, unzip=unzip)
 
 
