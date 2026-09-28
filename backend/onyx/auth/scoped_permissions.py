@@ -104,16 +104,18 @@ def assert_within_scope(
     requested_group_ids: Collection[int],
     is_non_public: bool,
 ) -> None:
-    """GATE 2 (write) — the authorization of record; raises 403 when out of scope.
+    """GATE 2（写侧）——正式的授权裁决；越界时抛 403。
 
-    ``is_non_public`` is the caller's non-public predicate (PUBLIC excluded; for a
-    cc_pair that admits PRIVATE or SYNC). On update, AND the current and requested
-    states so a currently-PUBLIC resource can't be converted into managed scope.
+    is_non_public 是调用方的“非公开”判定（排除 PUBLIC；对 cc_pair 而言，
+    PRIVATE 或 SYNC 都算非公开）。更新时要同时对“当前态”与“目标态”取 AND，
+    防止把一个当前为 PUBLIC 的资源被改造成受管理的私有范围。
 
-    Call before any try/except in the endpoint: it raises a 403 OnyxError that a
-    surrounding broad except would otherwise re-wrap as a 500. On create, pass
-    ``current_group_ids=[]``; on update, pass the groups re-read from the DB — never
-    the client's — so a reassignment can't escape scope."""
+    必须在端点里任何 try/except 之前调用：它抛出的 403 OnyxError 若被外层
+    宽泛的 except 捕获，会被错误地重新包装成 500。创建时传 current_group_ids=[]；
+    更新时要传从数据库重新读取的当前群组——绝不能用客户端传来的——
+    以免通过一次重新分配逃出范围。
+    """
+    # 委托纯判定函数 within_scope 出结果；返回 False 表示越权。
     if not within_scope(
         user,
         db_session,
@@ -122,6 +124,7 @@ def assert_within_scope(
         requested_group_ids=requested_group_ids,
         is_non_public=is_non_public,
     ):
+        # 先记录一条“权限拒绝”审计事件，附带本次判决的关键输入。
         _emit_denial(
             user,
             "within_scope",
@@ -132,6 +135,7 @@ def assert_within_scope(
                 "is_non_public": is_non_public,
             },
         )
+        # 再抛出 403：群组管理员只能操作其管理范围内的私有资源。
         raise OnyxError(
             OnyxErrorCode.INSUFFICIENT_PERMISSIONS,
             "Group managers can only act on private resources "

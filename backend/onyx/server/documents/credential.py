@@ -159,10 +159,10 @@ def swap_credentials_for_connector(
 def _assert_credential_share_within_scope(
     credential_info: CredentialBase, user: User, db_session: Session
 ) -> None:
-    """GATE 2 for both create paths — they build the same CredentialBase, so the gate
-    can't differ by transport. Only sharing needs bounding: an unshared credential is
-    private to its creator. CREDENTIAL_PERMISSIONS_TO_IGNORE sources (file, web, wiki)
-    carry no real secret and stay exempt."""
+    """两条创建路径共用的 GATE 2——它们构造同样的 CredentialBase，
+    所以门禁不随传输方式（JSON / 私钥文件）而变。只有“共享”才需要约束：
+    未共享的凭证本就对创建者私有。CREDENTIAL_PERMISSIONS_TO_IGNORE
+    里的源型（file、web、wiki）不含真正的密钥，保持豁免。"""
     is_shared = bool(credential_info.groups) or credential_info.curator_public
     if is_shared and credential_info.source not in CREDENTIAL_PERMISSIONS_TO_IGNORE:
         assert_within_scope(
@@ -183,9 +183,33 @@ def create_credential_from_model(
     ),
     db_session: Session = Depends(get_session),
 ) -> ObjectCreationIdResponse:
+    """创建一条凭证（Credential），保存其凭据内容与共享范围。
+
+    凭证是连接器访问外部数据源所需的密钥/令牌；本接口接收 JSON 形式的
+    凭据体，与 /credential/private-key（multipart、带私钥文件）互为两种传入方式。
+
+    步骤：
+        1. GATE 2 范围校验：仅当凭证要共享且有群组限制时才检查。
+        2. create_credential 落库，得到新凭证记录。
+        3. 写审计事件 CREDENTIAL_CREATE。
+        4. 返回新凭证 id 与脱敏后的快照。
+
+    参数：
+        credential_info：CredentialBase，含 credential_json、source、
+            admin_public、curator_public、groups、name。
+        user：依赖注入的当前用户，需持有 MANAGE_CONNECTORS（GATE 1）。
+        db_session：依赖注入的数据库会话。
+
+    返回：
+        ObjectCreationIdResponse，含新 credential.id 与脱敏 CredentialSnapshot。
+    """
+    # GATE 2：只有共享型凭证需要范围校验；未共享的凭证天然只对创建者私有。
     _assert_credential_share_within_scope(credential_info, user, db_session)
 
+    # 将凭证写入数据库。
     credential = create_credential(credential_info, user, db_session)
+
+    # 审计：记录凭证创建成功，附带源类型。
     emit_audit_event(
         AuditAction.CREDENTIAL_CREATE,
         AuditOutcome.SUCCESS,
@@ -194,6 +218,7 @@ def create_credential_from_model(
         resource_id=credential.id,
         extra={"source": credential_info.source.value},
     )
+    # 返回脱敏快照：用 mask_credential_prefix 隐藏凭据明文，只回传非敏感信息。
     return ObjectCreationIdResponse(
         id=credential.id,
         credential=CredentialSnapshot.from_credential_db_model(

@@ -1827,23 +1827,30 @@ def connector_run_once(
     ),
     db_session: Session = Depends(get_session),
 ) -> StatusResponse[int]:
-    """Used to trigger indexing on a set of cc_pairs associated with a
-    single connector."""
+    """对某个 connector 关联的一组 cc-pair 手动触发一次索引。
+
+    步骤：解析出要跑的凭证集合→逐个做 GATE 2 权限校验→为每个 cc-pair
+    写入索引触发。from_beginning 控制是从头重建还是增量同步。
+    """
     tenant_id = get_current_tenant_id()
 
     connector_id = run_info.connector_id
+    # 调用方指定的凭证子集；为空表示该连接器下全部凭证都要跑。
     specified_credential_ids = run_info.credential_ids
 
     try:
+        # 查出该连接器实际关联的全部凭证 id。
         possible_credential_ids = get_connector_credential_ids(
             run_info.connector_id, db_session
         )
     except ValueError:
+        # 连接器不存在。
         raise HTTPException(
             status_code=404,
             detail=f"Connector by id {connector_id} does not exist.",
         )
 
+    # 未指定则全量；指定了则必须是已有凭证的子集，否则报错。
     if not specified_credential_ids:
         credential_ids = possible_credential_ids
     else:
@@ -1855,13 +1862,15 @@ def connector_run_once(
                 detail="Not all specified credentials are associated with connector",
             )
 
+    # 最终集合为空：没有可索引的凭证。
     if not credential_ids:
         raise HTTPException(
             status_code=400,
             detail="Connector has no valid credentials, cannot create index attempts.",
         )
 
-    # GATE 2, all pairs up front — a mid-loop reject would leave attempts already queued
+    # GATE 2，一次性前置校验所有 pair——若放在循环中途拒绝，
+    # 会导致部分 cc-pair 的索引触发已经入队。
     for credential_id in credential_ids:
         if (
             get_connector_credential_pair_for_user(
@@ -1878,6 +1887,7 @@ def connector_run_once(
             )
 
     try:
+        # 权限全部通过后，为命中的每个 cc-pair 写入索引触发，返回触发数量。
         num_triggers = trigger_indexing_for_cc_pair(
             credential_ids,
             connector_id,

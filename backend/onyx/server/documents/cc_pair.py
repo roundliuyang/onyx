@@ -816,37 +816,36 @@ def associate_credential_to_connector(
     db_session: Session = Depends(get_session),
     tenant_id: str = Depends(get_current_tenant_id),
 ) -> StatusResponse[int]:
-    """NOTE(rkuo): internally discussed and the consensus is this endpoint
-    and create_connector_with_mock_credential should be combined.
+    """把凭证与连接器关联起来，建立 cc-pair，并立即触发索引。
 
-    The intent of this endpoint is to handle connectors that actually need credentials.
+    NOTE(rkuo)：内部讨论的共识是——本端点应与 create_connector_with_mock_credential
+    合并。本端点的意图是处理“真正需要凭证”的连接器。
+
+    整体流程：先做几道 GATE 2 鉴权，再校验并写入 cc-pair，
+    成功后标记租户活跃、发送 CHECK_FOR_INDEXING 任务并记审计。
     """
 
     if metadata.access_type == AccessType.SYNC_RESTRICTED:
-        # Becomes creatable in the same change that enforces its data-access
-        # groups at query time, so no restricted pair exists without them.
-        # TODO(evan, ENG-4342): remove this rejection in the enforcement change,
-        # together with:
-        # - the allowed-connector query filter and the /chat/file check
-        # - the creation path: restriction_group_ids, validation, persistence
-        #   (branch jtahara/connector-group-restrictions-creation-path)
-        # - SYNC-only checks in connector_credential_pair.py: listing
-        #   visibility, tier/source validation, get_all_auto_sync_cc_pairs,
-        #   get_cc_pairs_by_source
-        # - creating the pair and its data-access rows in one transaction
+        # 只有等到在查询时强制其数据访问组的同一改动落地后，它才变得可创建，
+        # 所以不存在“没有这些组的受限 pair”。
+        # TODO(evan, ENG-4342)：在强制生效的那次改动里移除这个拒绝，并同时移除：
+        # - allowed-connector 查询过滤与 /chat/file 检查
+        # - 创建路径：restriction_group_ids、校验、持久化
+        #   （分支 jtahara/connector-group-restrictions-creation-path）
+        # - connector_credential_pair.py 里仅 SYNC 的检查：列表可见性、
+        #   tier/source 校验、get_all_auto_sync_cc_pairs、get_cc_pairs_by_source
+        # - 在一个事务里创建 pair 及其 data-access 行
         raise OnyxError(
             OnyxErrorCode.FEATURE_NOT_AVAILABLE,
             "Restricted perm-synced connectors are not available yet.",
         )
 
-    # GATE 2 write authorization (see assert_within_scope).
+    # GATE 2 写授权（见 assert_within_scope）。
     #
-    # A permission-synced connector carrying no groups is exempt: its ACLs are
-    # mirrored from the source, so it cannot surface a document to anyone who
-    # could not already read it there. There is no reach for a group to bound,
-    # and requiring one would attach a group that does not affect access at all.
-    # Groups may still be supplied to scope who may *manage* it, and those are
-    # checked normally below.
+    # 不携带任何群组的权限同步连接器被豁免：它的 ACL 从数据源镜像而来，
+    # 不会把文档暴露给在原源本就读不到它的人。没有需要被群组约束的可达面，
+    # 强行要求只会挂上一个完全不影响访问的群组。
+    # 仍然可以传入群组来限定“谁可管理”，这些照常在下面校验。
     is_groupless_perm_sync = (
         metadata.access_type.is_perm_synced() and not metadata.groups
     )
@@ -860,8 +859,8 @@ def associate_credential_to_connector(
             is_non_public=metadata.access_type != AccessType.PUBLIC,
         )
 
-    # GATE 2 on the connector: it carries no creator or groups, so its pairs are what
-    # says who may edit it. Empty means nobody owns it yet (create-then-associate)
+    # 对 connector 的 GATE 2：它本身不带创建者或群组，所以它的 cc-pair 们
+    # 才决定谁能编辑它。为空表示暂无人拥有（先建后关联的情形）。
     existing_cc_pair_ids = get_cc_pair_ids_for_connector(db_session, connector_id)
     if existing_cc_pair_ids and not verify_user_can_edit_all_cc_pairs(
         existing_cc_pair_ids, db_session, user
@@ -871,8 +870,8 @@ def associate_credential_to_connector(
             "Connection not found for current user's permissions",
         )
 
-    # GATE 2 on the credential: validate_ccpair_for_user builds and probes the
-    # connector, so ownership has to be settled before it runs.
+    # 对 credential 的 GATE 2：validate_ccpair_for_user 会构建并探测连接器，
+    # 所以归属必须在它运行前先确定。
     if fetch_credential_by_id_for_user(credential_id, user, db_session) is None:
         raise OnyxError(
             OnyxErrorCode.CREDENTIAL_NOT_FOUND,
@@ -884,6 +883,7 @@ def associate_credential_to_connector(
             connector_id, credential_id, metadata.access_type, db_session
         )
 
+        # 正式建立 cc-pair（写入连接与凭证的关联及同步配置）。
         response = add_credential_to_connector(
             db_session=db_session,
             user=user,
@@ -897,16 +897,15 @@ def associate_credential_to_connector(
         )
 
         if not response.success:
-            # The pair already exists. This used to answer 200 with success in
-            # the body and the *connector* id in data, so a caller checking the
-            # status stored the wrong id and reported a no-op as a success.
+            # 该 pair 已存在。以前它会返回 200、body 里带 success、data 里却是
+            # *connector* 的 id，导致按状态码判断的调用方存错 id、把空操作当成成功。
             raise OnyxError(OnyxErrorCode.CONFLICT, response.message)
 
-        # Tenant-work-gating lifecycle hook: keep new-tenant latency to
-        # seconds instead of one full-fanout interval.
+        # 租户工作门控的生命周期钩子：把新租户的延迟压到秒级，
+        # 而不是等一整个 fan-out 周期。
         maybe_mark_tenant_active(tenant_id, caller="cc_pair_lifecycle")
 
-        # trigger indexing immediately
+        # 立即触发索引。
         client_app.send_task(
             OnyxCeleryTask.CHECK_FOR_INDEXING,
             priority=OnyxCeleryPriority.HIGH,
@@ -918,6 +917,7 @@ def associate_credential_to_connector(
             response.data,
         )
 
+        # 审计：记录 cc-pair 创建成功。
         emit_audit_event(
             AuditAction.CC_PAIR_CREATE,
             AuditOutcome.SUCCESS,
@@ -928,15 +928,16 @@ def associate_credential_to_connector(
         )
         return response
     except ValidationError as e:
+        # 连接器配置校验失败：归为无效输入。
         raise OnyxError(
             OnyxErrorCode.INVALID_INPUT,
             "Connector validation error: " + str(e),
         )
     except IntegrityError:
-        # The connector is a separately owned object the caller created before
-        # this call, so a failed association rolls back rather than deleting it.
-        # The unique name constraint this once reported was dropped in
-        # 76b60d407dfb, so a collision here is on (connector_id, credential_id).
+        # connector 是调用方在本次调用前单独创建、独立持有的对象，
+        # 所以关联失败时选择回滚而不是删除它。
+        # 这里曾报告的“唯一名约束”已在 76b60d407dfb 移除，
+        # 因此此处的冲突发生在 (connector_id, credential_id) 上。
         logger.exception("IntegrityError associating credential to connector")
         db_session.rollback()
 
@@ -947,10 +948,10 @@ def associate_credential_to_connector(
         )
 
     except OnyxError:
-        # Deliberate, already-classified failures must not be re-rendered as 500
-        # by the catch-all below.
+        # 已明确分类的主动失败，不能被下面的兜底 except 重新渲染成 500。
         raise
     except Exception as e:
+        # 未预期异常：记日志并统一包成 500。
         logger.exception("Unexpected error: %s", e)
 
         raise OnyxError(OnyxErrorCode.INTERNAL_ERROR, "Unexpected error")
