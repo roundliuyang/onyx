@@ -473,22 +473,33 @@ def create_new_chat_session(
     ),
     db_session: Session = Depends(get_session),
 ) -> CreateChatSessionID:
+    """创建聊天会话，返回会话 ID 和服务端确认的无痕状态。
+
+    项目内外的会话共用此接口，通过请求中的 project_id 区分。
+    传入项目 ID 时，下层函数校验项目访问权限，并将会话关联到该项目；
+    project_id 为 None 时，创建不关联项目的会话。
+    此接口仅创建会话，不发送消息，也不执行文件检索或模型生成。
+    """
     try:
+        # 将请求交给下层函数，统一校验项目、助手和无痕功能的使用权限，
+        # 再保存会话记录。这里不根据项目名称选择不同的处理流程。
         new_chat_session = create_chat_session_from_request(
             chat_session_request=chat_session_creation_request,
             user=user,
             db_session=db_session,
         )
     except OnyxError:
-        # Carries its own status and detail (e.g. incognito refused).
+        # 业务异常已包含错误码和详情，例如无痕功能不可用；直接交给全局异常处理器。
         raise
     except ValueError as e:
-        # Project or persona access denied
+        # 项目或助手访问权限校验失败时，返回 403，并保留下层提供的原因。
         raise HTTPException(status_code=403, detail=str(e))
     except Exception as e:
+        # 其他异常记录完整堆栈，并统一返回当前接口约定的 400 错误。
         logger.exception(e)
         raise HTTPException(status_code=400, detail="Invalid Persona provided.")
 
+    # 使用已创建会话的实际记录模式确认无痕状态，不直接回显客户端请求值。
     return CreateChatSessionID(
         chat_session_id=new_chat_session.id,
         incognito=new_chat_session.incognito_record_mode is not None,

@@ -126,10 +126,17 @@ def upload_files_to_user_files_with_indexing(
     background_tasks: BackgroundTasks | None = None,
     incognito_session_id: UUID | None = None,
 ) -> CategorizedFilesResult:
+    """保存用户上传的文件，并安排后台处理需要建立索引的文件。
+
+    返回已保存文件、被拒绝文件及临时 ID 映射，不等待后台索引处理完成。
+    """
+    # 指定项目时，先检查项目是否存在以及用户是否有权访问，避免越权上传。
     if project_id is not None and user is not None:
         if not check_project_ownership(project_id, user.id, db_session):
             raise HTTPException(status_code=404, detail="Project not found")
 
+    # 分类并上传可接收的文件，创建文件记录并提交数据库事务。
+    # 无痕文件会记录会话 ID，但不会加入项目，避免随项目长期保留。
     categorized_files_result = create_user_files(
         files,
         project_id,
@@ -140,10 +147,13 @@ def upload_files_to_user_files_with_indexing(
     )
     user_files = categorized_files_result.user_files
     rejected_files = categorized_files_result.rejected_files
+    # 将数据库中的文件 ID 映射到前端临时 ID，便于前端更新对应的上传记录。
     id_to_temp_id = categorized_files_result.id_to_temp_id
+    # 部分文件仅需保存，不需要建立索引；后台任务只处理需要索引的文件。
     indexable_files = categorized_files_result.indexable_files
-    # Trigger per-file processing immediately for the current tenant
+    # 将当前租户 ID 传给后台任务，确保任务在对应租户下处理文件。
     tenant_id = get_current_tenant_id()
+    # 单个文件被拒绝不阻止其他文件上传；记录原因并随结果返回。
     for rejected_file in rejected_files:
         logger.warning(
             "File %s rejected for %s", rejected_file.filename, rejected_file.reason
@@ -152,6 +162,8 @@ def upload_files_to_user_files_with_indexing(
     if DISABLE_VECTOR_DB and background_tasks is not None:
         from onyx.background.task_utils import drain_processing_loop
 
+        # 禁用向量数据库且提供后台任务容器时，在响应发送后执行进程内处理。
+        # 只添加一个循环任务，由它从数据库逐个领取处于 PROCESSING 状态的文件。
         background_tasks.add_task(drain_processing_loop, tenant_id)
         for user_file in indexable_files:
             logger.info(
@@ -160,6 +172,8 @@ def upload_files_to_user_files_with_indexing(
     else:
         from onyx.background.celery.versioned_apps.client import app as client_app
 
+        # 其他情况下，为每个需要索引的文件发送一个 Celery 任务。
+        # 使用文件处理专用队列和高优先级，并设置过期时间，避免任务无限积压。
         for user_file in indexable_files:
             task = client_app.send_task(
                 OnyxCeleryTask.PROCESS_SINGLE_USER_FILE,
@@ -174,6 +188,7 @@ def upload_files_to_user_files_with_indexing(
                 task.id,
             )
 
+    # 返回上传分类结果；任务已安排，但文件索引此时可能尚未完成。
     return CategorizedFilesResult(
         user_files=user_files,
         rejected_files=rejected_files,

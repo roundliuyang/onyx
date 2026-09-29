@@ -172,31 +172,36 @@ def create_chat_session_from_request(
     user: User,
     db_session: Session,
 ) -> ChatSession:
-    """Create a chat session from a ChatSessionCreationRequest.
+    """根据创建请求校验访问权限，并创建聊天会话。
 
-    Includes project ownership and persona access validation.
+    项目内外的会话共用此流程，通过 project_id 决定是否关联项目。
+    同时校验助手访问权限，并在创建时确定会话的无痕记录模式。
 
-    Args:
-        chat_session_request: The request containing persona_id, description, and project_id
-        user: The user creating the session. Anonymous users are represented as a
-            User with is_anonymous=True (never None); the access-check helpers
-            handle that case. A real User is required so the persona access check
-            always runs — do not introduce a None-tolerant caller.
-        db_session: The database session
+    参数:
+        chat_session_request: 包含助手 ID、会话描述、项目 ID 和无痕设置的请求。
+        user: 创建会话的用户。匿名用户也必须传入 User 对象，
+            其 is_anonymous 为 True，不能用 None 代替。
+            权限校验函数会处理匿名用户，不能因匿名身份跳过助手权限校验。
+        db_session: 用于权限查询和会话创建的数据库会话。
 
-    Returns:
-        The newly created ChatSession
+    返回:
+        新创建的聊天会话记录。
 
-    Raises:
-        ValueError: If user lacks access to the specified project or persona
-        Exception: If the persona is invalid
+    异常:
+        ValueError: 用户无权访问指定项目或助手。
+        OnyxError: 当前部署不支持无痕聊天，或用户未获准使用该功能。
+        Exception: 助手无效等下层处理异常。
     """
+    # 项目内创建会话时，先校验项目访问权限；项目外的请求不执行此检查。
+    # 判断依据是项目 ID，而不是项目名称，例如 rag demo。
     project_id = chat_session_request.project_id
     if project_id:
         if not check_project_ownership(project_id, user.id, db_session):
             raise ValueError("User does not have access to project")
 
     persona_id = chat_session_request.persona_id
+    # 默认助手不执行此项检查；自定义助手必须确认用户有使用权限。
+    # get_editable=False 表示只要求可以使用该助手，不要求可以编辑它。
     if persona_id != DEFAULT_PERSONA_ID:
         if not user_can_access_persona(
             db_session=db_session,
@@ -206,34 +211,33 @@ def create_chat_session_from_request(
         ):
             raise ValueError("User does not have access to persona")
 
-    # Pinned at creation so a later setting change cannot alter a live session.
-    # Availability decides server-side, never the client flag. A refusal
-    # errors: degrading would silently persist a believed-incognito chat.
-    # The capability is checked first so a deployment that cannot hold the
-    # context says so, rather than reporting it as a permission the admin
-    # could grant.
+    # 普通会话的记录模式为 None；请求无痕聊天时，由服务端决定是否允许。
+    # 无痕请求被拒绝时直接报错，不能改为普通会话，以免保存用户认为不会保存的内容。
     incognito_mode: IncognitoRecordMode | None = None
     if chat_session_request.incognito:
+        # 先检查部署是否具备无痕上下文支持，区分部署能力不足与用户权限不足。
         if not incognito_context_available():
             raise OnyxError(
                 OnyxErrorCode.DEPLOYMENT_UNSUPPORTED,
                 "Incognito chat is not supported on this deployment.",
             )
+        # 不使用缓存的权限结果，确保按当前设置检查用户是否可使用无痕功能。
         if not incognito_allowed_for_user(user, db_session, cached=False):
             raise OnyxError(
                 OnyxErrorCode.UNAUTHORIZED,
                 "Incognito chat is not enabled for this user.",
             )
+        # 创建时确定记录模式并写入会话，避免后续设置变更改变已有会话的模式。
         incognito_mode = resolve_incognito_record_mode()
 
-    # A caller-supplied title is conversation-derived, so a content-free
-    # session stores none of it.
+    # 会话描述或标题也可能包含对话内容。记录模式不允许保存内容时，使用空字符串。
     description = (
         chat_session_request.description or ""
         if record_mode_persists_content(incognito_mode)
         else ""
     )
 
+    # 将项目 ID 和已确定的记录模式传给数据库层，创建对应的会话记录。
     chat_session = create_chat_session(
         db_session=db_session,
         description=description,
@@ -241,6 +245,7 @@ def create_chat_session_from_request(
         persona_id=chat_session_request.persona_id,
         project_id=chat_session_request.project_id,
         incognito_record_mode=incognito_mode,
+        # 仅无痕会话使用请求预先指定的 ID，以便关联在会话创建前上传的文件。
         session_id=(
             chat_session_request.incognito_session_id if incognito_mode else None
         ),

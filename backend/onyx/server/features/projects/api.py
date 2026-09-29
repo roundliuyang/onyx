@@ -161,6 +161,7 @@ def create_project(
     user: User = Depends(require_permission(Permission.BASIC_ACCESS)),
     db_session: Session = Depends(get_session),
 ) -> UserProjectSnapshot:
+    """校验项目名称，为当前用户创建项目并返回项目快照。"""
     if name == "":
         raise HTTPException(status_code=400, detail="Project name cannot be empty")
     _validate_project_field_length(name, "name")
@@ -176,21 +177,32 @@ def upload_user_files(
     bg_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
     project_id: int | None = Form(None),
-    temp_id_map: str | None = Form(None),  # JSON string mapping hashed key -> temp_id
+    temp_id_map: str | None = Form(None),  # 哈希键到临时 ID 的 JSON 映射
     incognito_session_id: UUID | None = Form(None),
     user: User = Depends(require_permission(Permission.BASIC_ACCESS)),
     db_session: Session = Depends(get_session),
 ) -> CategorizedFilesSnapshot:
-    # The file names its session before that session exists, so it is private
-    # from the moment it lands and the id is what teardown finds it by.
+    """上传用户文件并安排索引处理，返回分类后的文件快照。
+
+    可将文件关联到项目或无痕会话。临时 ID 映射用于匹配前端上传记录。
+    """
+    # 请求携带 incognito_session_id 时，表示这些文件属于指定的无痕会话。
+    # 用户可能先上传文件，再发送消息，因此上传时会话记录可能还不存在。
+    # 后续上传函数会将此 ID 写入文件记录，使文件从保存时起就按无痕文件处理。
+    # 会话结束后，清理流程可通过此 ID 找到对应文件，不必依赖会话已创建。
     if incognito_session_id is not None:
+        # 携带会话 ID 不代表用户有权使用无痕功能，仍需检查当前用户的权限。
+        # cached=False 表示不使用缓存的权限结果，避免权限变更后仍允许上传。
         if not incognito_allowed_for_user(user, db_session, cached=False):
             raise OnyxError(
                 OnyxErrorCode.UNAUTHORIZED,
                 "Incognito chat is not enabled for this user.",
             )
-        # Teardown marks the rows that exist when it runs, so an upload landing
-        # after it would otherwise sit until the orphan sweep.
+        # 会话可能已结束，但先前发出的上传请求此时才到达服务端。
+        # 清理流程只能标记执行时已有的文件记录，无法覆盖之后保存的新文件。
+        # 如果继续上传，这些文件会错过本次清理，只能等待后续的孤立文件扫描。
+        # 因此，发现会话已有结束标记时，立即拒绝上传。
+        # 若会话在本次检查后才结束，则由下方 finally 中的检查补充处理。
         if incognito_session_torn_down(incognito_session_id):
             raise OnyxError(
                 OnyxErrorCode.INVALID_INPUT,
@@ -198,18 +210,19 @@ def upload_user_files(
             )
     try:
         parsed_temp_id_map: dict[str, str] | None = None
+        # 忽略无效 JSON 或非字典映射，使文件仍可正常上传。
         if temp_id_map:
             try:
                 parsed = json.loads(temp_id_map)
                 if isinstance(parsed, dict):
-                    # Ensure all keys/values are strings
+                    # 将所有键和值统一转换为字符串。
                     parsed_temp_id_map = {str(k): str(v) for k, v in parsed.items()}
                 else:
                     parsed_temp_id_map = None
             except json.JSONDecodeError:
                 parsed_temp_id_map = None
 
-        # Use our consolidated function that handles indexing properly
+        # 统一处理文件上传与索引；禁用向量数据库时使用请求后台任务。
         categorized_files_result = upload_files_to_user_files_with_indexing(
             files=files,
             project_id=project_id,
@@ -229,8 +242,7 @@ def upload_user_files(
             detail="Failed to upload files. Please try again or contact support if the issue persists.",
         )
     finally:
-        # Rows are committed before the indexing hand-off, which can still
-        # fail, so this runs on every exit.
+        # 文件记录在索引任务交接前已提交；即使交接失败，也要检查会话是否结束。
         _claim_upload_if_session_ended(db_session, incognito_session_id, user.id)
 
 
@@ -240,7 +252,9 @@ def get_project(
     user: User = Depends(require_permission(Permission.BASIC_ACCESS)),
     db_session: Session = Depends(get_session),
 ) -> UserProjectSnapshot:
+    """返回当前用户的指定项目快照；项目不存在或不属于该用户时返回 404。"""
     user_id = user.id
+    # 同时限定项目 ID 和用户 ID，防止访问其他用户的项目。
     project = (
         db_session.query(UserProject)
         .filter(UserProject.id == project_id, UserProject.user_id == user_id)
