@@ -316,24 +316,23 @@ def resolve_context_user_files(
     user_id: UUID | None,
     db_session: Session,
 ) -> list[UserFile]:
-    """Apply the precedence rule to decide which user files to load.
+    """选择本轮使用的文件记录，不读取文件正文。
 
-    A custom persona fully supersedes the project.  When a chat uses a
-    custom persona, the project is purely organisational — its files are
-    never loaded and never made searchable.
+    自定义助手（ID≠0）使用自身文件；默认助手（ID=0）在项目内使用项目文件。
+    其余情况返回空列表。由 build_chat_turn 调用，结果交给 extract_context_files。
 
-    Custom persona → persona's own user_files (may be empty).
-    Default persona inside a project → project files.
-    Otherwise → empty list.
     """
+    # 自定义助手没有文件时也直接返回空列表，不退回使用项目文件。
     if persona.id != DEFAULT_PERSONA_ID:
         return list(persona.user_files) if persona.user_files else []
+    # 默认助手在项目内：查询项目文件，下层函数同时检查项目访问权限。
     if project_id:
         return get_user_files_from_project(
             project_id=project_id,
             user_id=user_id,
             db_session=db_session,
         )
+    # 默认助手在项目外：不加载项目或助手文件；消息附件由其他流程处理。
     return []
 
 
@@ -545,37 +544,43 @@ def determine_search_params(
     project_id: int | None,
     extracted_context_files: ExtractedContextFiles,
 ) -> SearchParams:
-    """Decide which search filter IDs and search-tool usage apply for a chat turn.
+    """确定文件搜索范围和工具策略，不执行检索。
 
-    A custom persona fully supersedes the project — project files are never
-    searchable and the search tool config is entirely controlled by the
-    persona.  The project_id filter is only set for the default persona.
+    默认助手（ID=0）使用项目文件；自定义助手（ID≠0）只使用自身文件。
+    默认助手在项目内：需要检索时 ENABLED，已加载文本或文件 token 总量为零时
+    DISABLED，其余情况保留 AUTO。自定义助手和项目外会话均保留 AUTO。
 
-    For the default persona inside a project:
-      - Files overflow  → ENABLED  (vector DB scopes to these files)
-      - Files fit       → DISABLED (content already in prompt)
-      - No files at all → DISABLED (nothing to search)
+    由 build_chat_turn 在提取文件后调用，结果供 _run_models 构建搜索工具。
     """
     is_custom_persona = persona_id != DEFAULT_PERSONA_ID
 
     project_id_filter: int | None = None
     persona_id_filter: int | None = None
+    # 文件无法直接放入上下文且上游允许搜索时，将检索范围限定到对应文件集合。
+    # 两种过滤条件互斥，避免自定义助手同时检索所在项目的文件。
     if extracted_context_files.use_as_search_filter:
         if is_custom_persona:
             persona_id_filter = persona_id
         else:
             project_id_filter = project_id
 
+    # AUTO 不表示一定执行搜索；本函数只决定工具配置，实际调用由后续流程决定。
     search_usage = SearchToolUsage.AUTO
     if not is_custom_persona and project_id:
+        # 使用裁剪前的 token 总量判断是否有文件内容，而不是检查文件记录数量。
         has_context_files = bool(extracted_context_files.uncapped_token_count)
+        # 这里只检查已加载的文本，不包含图片或仅提供元数据的文件。
         files_loaded_in_context = bool(extracted_context_files.file_texts)
 
         if extracted_context_files.use_as_search_filter:
+            # 文件内容需要通过检索获取，启用搜索工具并使用上方的项目过滤条件。
             search_usage = SearchToolUsage.ENABLED
         elif files_loaded_in_context or not has_context_files:
+            # 文本已在上下文中，或没有文件内容可搜索，无需再提供搜索工具。
             search_usage = SearchToolUsage.DISABLED
+        # 例如禁用向量数据库后的文件溢出情况，不满足上述条件，继续保留 AUTO。
 
+    # 记录策略和上下文状态，便于排查本轮为何启用或禁用搜索。
     logger.info(
         "[RAG_TRACE] search_params usage=%s context_texts=%d use_as_search_filter=%s",
         search_usage,
