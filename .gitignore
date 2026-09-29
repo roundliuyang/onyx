@@ -67,3 +67,4 @@ plans
 .claude/scheduled_tasks.lock
 .claude/worktrees/
 !.claude/settings.json
+.idea_副本/*
